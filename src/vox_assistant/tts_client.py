@@ -10,8 +10,12 @@ from voxvortex.tts import normalize_for_speech
 
 
 class ClonedVoiceTTS:
+    speaks_hindi = True  # VoxCPM2 speaks Hindi; the service prepares Hindi text (speech_text) itself
+
     def __init__(self, base_url: str, *, sample_rate: int = 48000, voice: str | None = None,
-                 preset: str | None = None, timeout: float = 120.0, normalize: bool = True) -> None:
+                 preset: str | None = None, timeout: float = 120.0, normalize: bool = False) -> None:
+        # normalize: VoxVortex's English normalizer, off by default: it mangles names ("R9700") and Hindi numbers, and
+        # the service now prepares text per language (speech_text).
         self.sample_rate = sample_rate  # VoxCPM2's native rate; updated from the first response header
         self.voice, self.preset, self.normalize = voice, preset, normalize
         self._client = httpx.AsyncClient(base_url=base_url, timeout=httpx.Timeout(timeout, connect=3.0))

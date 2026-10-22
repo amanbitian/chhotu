@@ -41,7 +41,7 @@ class FakeTTS:
         if self.fail:
             raise RuntimeError("service down")
         self.spoken.append(text)
-        yield b"\x01\x00" * 1600
+        yield b"\x00\x10" * 1600  # audible (4096), so leading-silence trimming keeps it
 
 
 class FakeSpeaker:
@@ -66,7 +66,9 @@ class ScriptedLLM:
         if max_tokens == 1:  # a pre-warm, not a turn
             self.warms = getattr(self, "warms", 0) + 1
             return
-        self.users.append(re.sub(r"^\[\d\d:\d\d\] ", "", [m["content"] for m in messages if m["role"] == "user"][-1]))
+        last = [m["content"] for m in messages if m["role"] == "user"][-1]
+        self.langs = getattr(self, "langs", []) + [re.match(r"^\[\d\d:\d\d, reply in (\w+)\]", last).group(1)]
+        self.users.append(re.sub(r"^\[\d\d:\d\d, reply in \w+\] ", "", last))
         if self.delay:
             await asyncio.sleep(self.delay)
         for ev in self.rounds.pop(0) if self.rounds else [TextDelta("ok.")]:
@@ -366,6 +368,85 @@ async def test_speculative_transcript_is_used_when_the_pause_becomes_the_end(set
     loop, _, _ = build(settings, tmp_path, asr=asr, llm=llm)
     await loop.run(feed([VOICED] * 12 + [QUIET] * 9 + [VOICED] * 12 + [QUIET] * 18))
     assert llm.users == ["what time is it"]
+
+
+def test_lead_trim_drops_opening_silence_across_pieces_and_keeps_a_little():
+    import numpy as np
+
+    from vox_assistant.voice import LeadTrim
+
+    rate = 1000
+    silence, voice = np.zeros(300, np.int16), np.full(200, 5000, np.int16)
+    trim = LeadTrim(rate, keep_s=0.02)
+    out = trim(silence[:150].tobytes()) + trim(silence[150:].tobytes()) + trim(voice.tobytes()) + trim(silence.tobytes())
+    a = np.frombuffer(out, np.int16)
+    assert len(a) == 20 + 200 + 300 and (a[:20] == 0).all() and (a[20:220] == 5000).all()  # later silence untouched
+    quiet = LeadTrim(rate, max_s=0.5)  # never more than max_s is dropped, even if the clip is all silence
+    assert quiet(silence.tobytes()) == b"" and len(quiet(silence.tobytes())) == (30 + 300) * 2  # 30 ms lead kept
+
+
+def test_resampler_is_seamless_across_pieces():
+    import numpy as np
+
+    from vox_assistant.audio_io import Resampler
+
+    t = np.arange(22050) / 22050
+    x = (np.sin(2 * np.pi * 440 * t) * 10000).astype(np.int16)
+    whole = np.frombuffer(Resampler(22050)(x.tobytes()), np.int16)
+    r = Resampler(22050)
+    pieces = np.frombuffer(b"".join(r(x[i:i + 977].tobytes()) for i in range(0, len(x), 977)), np.int16)
+    assert abs(len(whole) - 48000) <= 3 and abs(len(pieces) - len(whole)) <= 1
+    n = min(len(whole), len(pieces))
+    assert np.abs(whole[:n].astype(int) - pieces[:n]).max() <= 1  # identical whether it arrives whole or in pieces
+
+
+async def test_reminder_is_marked_fired_only_after_it_was_spoken(settings, tmp_path):
+    from vox_assistant.tools.reminders import ReminderStore
+
+    now = [1000.0]
+    store = ReminderStore(tmp_path / "r.sqlite3", clock=lambda: now[0])
+    store.add("check the print", 0)
+    assert [r["text"] for r in store.claim_due()] == ["check the print"]
+    assert store.claim_due() == []  # claimed: not handed out twice
+    now[0] += 121  # the process died before speaking it: after two minutes it is due again
+    r = store.claim_due()
+    assert [x["text"] for x in r] == ["check the print"]
+    store.mark_fired(r[0]["id"])
+    now[0] += 500
+    assert store.claim_due() == [] and store.due() == []
+    store.close()
+
+
+async def test_hindi_wake_phrase_and_auto_language_reply(settings, tmp_path):
+    from vox_assistant.asr_gpu import join_readings
+
+    llm = ScriptedLLM([TextDelta("ठीक है।")])
+    asr = FakeASR(join_readings(["हे वाक्स, भारत की राजधानी क्या है?", "Hey Vox, Bharat ki rajdhani kya hai?"]))
+    loop, _, _ = build(settings, tmp_path, asr=asr, llm=llm)
+    await loop.run(feed(utterance()))
+    assert llm.users == [join_readings(["भारत की राजधानी क्या है", "bharat ki rajdhani kya hai"])]  # wake stripped from both
+    assert llm.langs == ["Hindi"]  # auto: replies in the language spoken
+
+
+async def test_switch_language_by_voice_then_confirm_in_hindi(settings, tmp_path):
+    llm = ScriptedLLM([ToolCall("c1", "poke", {}, "{}")], [TextDelta("हो गया।")])
+    tts = FakeTTS()
+    asr = FakeASR("hey vox hindi mein baat karo", "hey vox poke it", "हाँ")
+    loop, events, ran = build(settings, tmp_path, asr=asr, llm=llm, tts=tts)
+    gap = [QUIET] * 40
+    await loop.run(feed(utterance() + gap + utterance() + gap + utterance()))
+    assert [e["mode"] for e in events if e["kind"] == "language"] == ["hi"]
+    assert tts.spoken[0] == "ठीक है, अब हिंदी में बात करते हैं।"
+    assert llm.langs == ["Hindi", "Hindi"]  # English words, Hindi reply: the mode decides
+    assert any("करूँ?" in s for s in tts.spoken) and ran == [{}]  # asked in Hindi, "हाँ" approved
+
+
+async def test_hindi_no_refuses(settings, tmp_path):
+    settings.language = "hi"
+    llm = ScriptedLLM([ToolCall("c1", "poke", {}, "{}")], [TextDelta("ठीक है।")])
+    loop, events, ran = build(settings, tmp_path, asr=FakeASR("hey vox poke it", "नहीं, मत करो"), llm=llm)
+    await loop.run(feed(utterance() + [QUIET] * 40 + utterance()))
+    assert ran == [] and [e["approved"] for e in events if e["kind"] == "confirm_result"] == [False]
 
 
 async def test_due_reminders_are_spoken(settings, tmp_path):

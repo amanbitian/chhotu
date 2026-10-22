@@ -71,6 +71,21 @@ async def test_speak_proxies_cloned_voice_and_reports_timing(client):
     assert (await client.post("/api/speak", json={"text": "  "})).status_code == 400
 
 
+async def test_speak_stream_relays_pcm_with_its_rate_and_asks_for_pcm(settings):
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, content=b"\x01\x00" * 4800, headers={"x-sample-rate": "48000", "x-voice": "me_v1"})
+
+    app = create_app(settings, llm=ScriptedLLM(), tts_transport=httpx.MockTransport(handler))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8765") as c:
+        r = await c.post("/api/speak/stream", json={"text": "Hello there.", "voice_mode": "cloned"})
+        assert r.status_code == 200 and r.headers["x-sample-rate"] == "48000" and r.headers["x-ai-generated"] == "true"
+        assert len(r.content) == 9600 and seen[0]["response_format"] == "pcm"
+        assert (await c.post("/api/speak/stream", json={"text": " "})).status_code == 400
+
+
 async def test_speak_reports_a_stopped_tts_service(settings):
     def down(request):
         raise httpx.ConnectError("refused")
@@ -98,8 +113,17 @@ async def test_chat_streams_tool_and_text(client):
     r = await client.post("/api/chat", json={"text": "how is my pc"})
     evs = await events(r)
     types = [e["type"] for e in evs]
-    assert types == ["tool", "tool_result", "say", "done"]
-    assert evs[1]["ok"] is True and evs[1]["decision"] == "auto"
+    assert types == ["language", "tool", "tool_result", "say", "done"]
+    assert evs[0]["reply"] == "en"
+    assert evs[2]["ok"] is True and evs[2]["decision"] == "auto"
+
+
+async def test_chat_reply_language_follows_the_selector_or_the_user(client):
+    client.llm.rounds = [[TextDelta("दिल्ली।")], [TextDelta("Delhi.")]]
+    evs = await events(await client.post("/api/chat", json={"text": "भारत की राजधानी क्या है?", "language": "auto"}))
+    assert evs[0] == {"type": "language", "mode": "auto", "reply": "hi"}
+    evs = await events(await client.post("/api/chat", json={"text": "भारत की राजधानी क्या है?", "language": "en"}))
+    assert evs[0]["reply"] == "en"
 
 
 @pytest.fixture

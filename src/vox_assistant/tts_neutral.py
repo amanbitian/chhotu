@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import tempfile
 import wave
 from pathlib import Path
@@ -25,17 +26,42 @@ $s.Dispose()
 """
 
 
-class NeutralVoiceTTS:
-    sample_rate = 22050
+_DEVANAGARI = re.compile("[ऀ-ॿ]")
 
-    def __init__(self, voice: str | None = None, rate: int = 1) -> None:
-        self.voice, self.rate = voice, rate
+
+class NeutralVoiceTTS:
+    """`hindi`: an engine for text in Devanagari, since Windows here has no Hindi voice (installing the Hindi speech pack
+    adds one; then pass its name as `hindi_voice`). Normally the voice service with a synthetic, non-cloned reference,
+    so a neutral voice stays neutral in Hindi too. `sample_rate` follows whichever engine spoke last."""
+
+    def __init__(self, voice: str | None = None, rate: int = 1, hindi=None, hindi_voice: str | None = None) -> None:
+        self.voice, self.rate, self.hindi, self.hindi_voice = voice, rate, hindi, hindi_voice
+        self.sample_rate = 22050
+
+    @property
+    def speaks_hindi(self) -> bool:
+        return self.hindi is not None or bool(self.hindi_voice)
 
     async def synth(self, text: str) -> AsyncIterator[bytes]:
+        if _DEVANAGARI.search(text):
+            if self.hindi_voice:
+                async for chunk in self._sapi(text, self.hindi_voice):
+                    yield chunk
+                return
+            if self.hindi is not None:
+                async for chunk in self.hindi.synth(text):
+                    self.sample_rate = self.hindi.sample_rate
+                    yield chunk
+                return
+        async for chunk in self._sapi(text, self.voice):
+            yield chunk
+
+    async def _sapi(self, text: str, voice: str | None) -> AsyncIterator[bytes]:
+        self.sample_rate = 22050
         fd, out = tempfile.mkstemp(suffix=".wav", prefix="voxa_")
         os.close(fd)
         env = {**os.environ, "VOXA_SAPI_TEXT": text, "VOXA_SAPI_OUT": out, "VOXA_SAPI_RATE": str(self.rate),
-               "VOXA_SAPI_VOICE": self.voice or ""}
+               "VOXA_SAPI_VOICE": voice or ""}
         try:
             proc = await asyncio.create_subprocess_exec(
                 "powershell", "-NoProfile", "-NonInteractive", "-Command", _SCRIPT, env=env,

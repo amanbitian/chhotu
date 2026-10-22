@@ -5,25 +5,28 @@ only when a request needs the model. It keeps one resident model and a small LRU
 resolves the active voice profile on every request, so switching or revoking a voice takes effect at once.
 
 POST /audio/speech  {"input": str, "voice": profile id | null, "response_format": "pcm" | "wav"}
-    pcm streams raw 16-bit mono sentence by sentence (sample rate in the X-Sample-Rate header).
+    pcm streams raw 16-bit mono as the model produces it, in ~0.16 s pieces (sample rate in X-Sample-Rate);
+    wav returns one labelled file.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import random
 import re
 import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+from . import speech_text
 from .config import Settings
 from .disclosure import labelled_wav
 from .security import install_local_only
@@ -35,6 +38,7 @@ PRESETS = {
     "Quality": {"steps": 16, "cfg": 2.0, "attempts": 3},
 }
 _SENTENCE = re.compile(r"(?<=[.!?।॥])\s+|\n+")
+_DEVANAGARI = re.compile(r"[ऀ-ॿ]")
 MAX_CHARS = 240
 PROMPT_CACHE = 8
 
@@ -58,6 +62,24 @@ def split_for_tts(text: str, max_chars: int = MAX_CHARS) -> list[str]:
 
 def pcm16(audio: np.ndarray) -> bytes:
     return (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+
+
+def stream_generate(backend: Any, text: str, cache: Any, preset: dict, seed: int) -> Iterator[np.ndarray]:
+    """Audio as the model produces it. VoxCPM2 decodes one latent patch at a time (~0.16 s at 48 kHz), so the first
+    audio is ready ~0.07 s after the request instead of after the whole sentence (1.2-2.6 s measured). Backends without
+    a streaming mode yield the sentence as one piece."""
+    stream = getattr(getattr(backend, "model", None), "generate_with_prompt_cache_streaming", None)
+    if stream is None:
+        yield backend.generate(text, cache, preset, seed)
+        return
+    torch = backend.torch
+    random.seed(seed)  # VoxCPM 2.0.3 has no seed argument; same seeding as VoxBackend.generate
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    with torch.inference_mode():
+        for wav, _, _ in stream(target_text=text, prompt_cache=cache, inference_timesteps=preset["steps"],
+                                cfg_value=preset["cfg"], max_len=1024):
+            yield wav.squeeze(0).float().cpu().numpy()
 
 
 class SpeechRequest(BaseModel):
@@ -117,32 +139,69 @@ def resolve_device(wanted: str) -> str:
 
 class SimilarityBody(BaseModel):
     compare_with: str | None = None
+    sentence: str | None = None  # e.g. a Hindi sentence: does the voice stay the same person in another language?
+
+
+class AsrBody(BaseModel):
+    pcm_b64: str  # 16 kHz mono PCM16, base64 (the request guard admits JSON bodies only)
+    languages: list[str] = ["hi", "en"]
+
+
+_runtime_ready = False
+
+
+def prepare_runtime(settings: Settings) -> None:
+    """Everything PyTorch needs on this machine before the first `import torch`; idempotent. Shared by the voice model
+    and speech recognition."""
+    global _runtime_ready
+    if _runtime_ready:
+        return
+    import os
+    import sys
+
+    if settings.tts_hip_runtime == "driver":
+        use_driver_hip_runtime()
+    # Only matters if MIOpen is switched back on (see below): its default find mode benchmarks every new shape.
+    os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+    root = settings.audio_clone_root
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    os.environ.setdefault("VOICE_STUDIO_DATA", str(root))
+    from voice_studio.config import Settings as StudioSettings
+    from voice_studio.runtime import configure_runtime
+
+    configure_runtime(StudioSettings.from_env())  # caches and ROCm target family; must precede `import torch`
+    import torch
+
+    # PyTorch's own convolutions instead of MIOpen's. Measured here: MIOpen crashes (access violation, in any find
+    # mode) on the tiny shapes of streaming decode, and in its default mode it spent 10-25 s tuning every new
+    # sentence length. Without it, whole-sentence synthesis is as fast as before (RTF ~0.45) and streaming works.
+    torch.backends.cudnn.enabled = settings.tts_miopen
+    _runtime_ready = True
 
 
 def _default_backend_factory(settings: Settings) -> Callable[[], Any]:
     def make():
         import os
-        import sys
 
-        if settings.tts_hip_runtime == "driver":
-            use_driver_hip_runtime()
-        # MIOpen's default find mode benchmarks kernels for every new tensor shape, and every new sentence length is a
-        # new shape: measured 10-25 s for the first synthesis of each length (RTF 4-5). FAST picks a kernel at once:
-        # first runs cost the same as repeats (RTF ~0.5-0.65), for ~20% slower warm synthesis.
-        os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
-        root = settings.audio_clone_root
-        if str(root) not in sys.path:
-            sys.path.insert(0, str(root))
-        os.environ.setdefault("VOICE_STUDIO_DATA", str(root))
-        from voice_studio.config import Settings as StudioSettings
-        from voice_studio.runtime import configure_runtime
-
-        configure_runtime(StudioSettings.from_env())  # caches and ROCm target family; must precede `import torch`
+        prepare_runtime(settings)
         if settings.tts_device != "auto":
             os.environ["VOICE_STUDIO_DEVICE"] = resolve_device(settings.tts_device)
+        from voice_studio.config import Settings as StudioSettings
         from voice_studio.engine import VoxBackend
 
         return VoxBackend(StudioSettings.from_env())
+
+    return make
+
+
+def _default_asr_factory(settings: Settings) -> Callable[[], Any]:
+    def make():
+        from .asr_gpu import GpuWhisper
+
+        prepare_runtime(settings)
+        device = settings.asr_device or settings.tts_device
+        return GpuWhisper(settings.asr_model, resolve_device(device) if device != "auto" else "cuda:0")
 
     return make
 
@@ -167,8 +226,11 @@ class TTSState:
             self.load_seconds = time.perf_counter() - t0
         return self.backend
 
-    def resolve(self, voice_id: str | None) -> dict:
-        profile = self.profiles.get(voice_id) if voice_id else self.profiles.active()
+    def resolve(self, voice_id: str | None, text: str = "") -> dict:
+        """The explicit voice, else the active voice for the text's language (Devanagari -> the Hindi reference if one
+        is set), else the main voice."""
+        lang = "hi" if _DEVANAGARI.search(text) else "en"
+        profile = self.profiles.get(voice_id) if voice_id else self.profiles.active(lang)
         if profile is None:
             raise VoiceError("No active voice profile. Enroll one with `vox enroll` or pick one in the web UI.")
         return profile
@@ -195,11 +257,19 @@ class TTSState:
             self.backend = None
 
 
-def create_app(settings: Settings | None = None, backend_factory: Callable[[], Any] | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, backend_factory: Callable[[], Any] | None = None,
+               asr_factory: Callable[[], Any] | None = None) -> FastAPI:
     settings = settings or Settings.load()
     state = TTSState(settings, backend_factory or _default_backend_factory(settings))
-    app = FastAPI(title="VoxVortex cloned-voice TTS")
+    asr_state: dict[str, Any] = {"factory": asr_factory or _default_asr_factory(settings), "model": None}
+
+    def asr_model() -> Any:
+        if asr_state["model"] is None:
+            asr_state["model"] = asr_state["factory"]()
+        return asr_state["model"]
+    app = FastAPI(title="VoxVortex voice service (cloned speech + speech recognition)")
     app.state.tts = state
+    app.state.asr_model = asr_model
     install_local_only(app)
 
     @app.get("/health")
@@ -212,6 +282,7 @@ def create_app(settings: Settings | None = None, backend_factory: Callable[[], A
             "runtime": getattr(b, "description", None),
             "load_seconds": state.load_seconds,
             "active_voice": state.profiles.active_id(),
+            "asr_loaded": asr_state["model"] is not None,
         }
 
     @app.get("/voices")
@@ -243,6 +314,33 @@ def create_app(settings: Settings | None = None, backend_factory: Callable[[], A
 
         return {"runtime": await asyncio.to_thread(work)}
 
+    @app.post("/asr")
+    async def asr(body: AsrBody) -> dict:
+        """Transcribe one utterance in each requested language (one GPU batch) and combine them for the assistant."""
+        import base64
+
+        from .asr_gpu import combine
+
+        try:
+            pcm = base64.b64decode(body.pcm_b64, validate=True)
+        except ValueError:
+            raise HTTPException(400, "pcm_b64 is not base64")
+        if not pcm or len(pcm) > 16000 * 2 * 60:
+            raise HTTPException(400, "send 16 kHz PCM16 audio, at most 60 s")
+        audio = np.frombuffer(pcm[: len(pcm) // 2 * 2], dtype=np.int16).astype(np.float32) / 32768.0
+
+        def work() -> dict:
+            t0 = time.perf_counter()
+            model = asr_model()
+            readings = model.readings(audio, tuple(body.languages), {"en": settings.asr_prompt, "hi": settings.asr_prompt_hi})
+            scores = getattr(model, "last_scores", {})
+            text, used = combine(readings.get("hi", ""), readings.get("en", ""), scores) \
+                if set(body.languages) == {"hi", "en"} else (next(iter(readings.values()), ""), body.languages[0])
+            return {"text": text, "used": used, "readings": readings, "scores": scores,
+                    "seconds": round(time.perf_counter() - t0, 3)}
+
+        return await asyncio.to_thread(work)
+
     @app.post("/voices/{profile_id}/similarity")
     async def similarity(profile_id: str, body: SimilarityBody | None = None) -> dict:
         """Clone a fixed sentence with this profile and score it against the reference recording (NFR-05).
@@ -261,17 +359,18 @@ def create_app(settings: Settings | None = None, backend_factory: Callable[[], A
         def work() -> dict:
             import soundfile as sf
 
+            sentence = speech_text.normalize((body.sentence if body and body.sentence else TEST_SENTENCE).strip())
             with state.lock:
                 backend = state.ensure_loaded()
                 cache, _ = state.prompt_for(backend, profile)
-                audio = backend.generate(TEST_SENTENCE, cache, PRESETS[settings.tts_preset], 7)
+                audio = backend.generate(sentence, cache, PRESETS[settings.tts_preset], 7)
                 backend.synchronize()
                 rate = backend.sample_rate
             ref, ref_rate = sf.read(profile["path"], dtype="float32")
             clone = state.embedder.embed(audio, rate)
             score = cosine(state.embedder.embed(ref, ref_rate), clone)
             out = {"voice": profile["id"], "similarity": round(score, 4), "threshold": SAME_SPEAKER_THRESHOLD,
-                   "same_speaker": score >= SAME_SPEAKER_THRESHOLD, "sentence": TEST_SENTENCE}
+                   "same_speaker": score >= SAME_SPEAKER_THRESHOLD, "sentence": sentence}
             if other:
                 o, o_rate = sf.read(other["path"], dtype="float32")
                 out.update(compared_with=other["id"], other_speaker_similarity=round(cosine(state.embedder.embed(o, o_rate), clone), 4))
@@ -327,10 +426,11 @@ def create_app(settings: Settings | None = None, backend_factory: Callable[[], A
             raise HTTPException(400, f"preset must be one of {sorted(PRESETS)}")
         preset = PRESETS[preset_name]
         try:
-            profile = state.resolve(body.voice)
+            profile = state.resolve(body.voice, text)
         except VoiceError as exc:
             raise HTTPException(409, str(exc))
-        chunks = split_for_tts(text)
+        # Each sentence as the model should read it: Hindi numbers as Hindi words, Hinglish ones in English, English as is.
+        chunks = [speech_text.normalize(c) for c in split_for_tts(text)]
         if not chunks:
             raise HTTPException(400, "input has nothing to speak")
 
@@ -345,6 +445,9 @@ def create_app(settings: Settings | None = None, backend_factory: Callable[[], A
                 took = time.perf_counter() - begin
             return audio, {"seconds": took, "prompt_cache_hit": hit, "audio_seconds": len(audio) / backend.sample_rate,
                            "sample_rate": backend.sample_rate, "overhead_seconds": begin - t0}
+
+        if body.response_format == "pcm" and settings.tts_stream:
+            return await stream_pcm(chunks, profile, preset, preset_name, body.seed)
 
         first_audio, first_meta = await asyncio.to_thread(synth_chunk, 0, chunks[0])
         rate = first_meta["sample_rate"]
@@ -375,6 +478,60 @@ def create_app(settings: Settings | None = None, backend_factory: Callable[[], A
 
         return StreamingResponse(stream(), media_type="audio/L16", headers=headers)
 
+    async def stream_pcm(chunks: list[str], profile: dict, preset: dict, preset_name: str, seed: int):
+        """Generate on a worker thread, hand each piece to the response as soon as it exists.
+
+        The first piece is awaited before the response starts, so a failure is still an HTTP error. When the client
+        goes away (barge-in), the worker stops after the piece in progress, freeing the GPU within ~0.1 s."""
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        stop = threading.Event()
+        timing: dict = {}
+
+        def put(item) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, item)
+
+        def generate(backend, cache) -> None:
+            for i, chunk in enumerate(chunks):
+                for piece in stream_generate(backend, chunk, cache, preset, (seed + i) % 2**32):
+                    if stop.is_set():
+                        return
+                    put(pcm16(piece))
+
+        def worker() -> None:
+            try:
+                t0 = time.perf_counter()
+                with state.lock:  # one GPU request at a time; /warm never waits for it
+                    timing["lock_wait"] = time.perf_counter() - t0
+                    backend = state.ensure_loaded()
+                    cache, _ = state.prompt_for(backend, profile)
+                    timing["rate"] = backend.sample_rate
+                    generate(backend, cache)
+            except Exception as exc:  # reported as an HTTP error if nothing was sent yet
+                put(exc)
+            finally:
+                put(None)
+
+        loop.run_in_executor(None, worker)
+        first = await queue.get()
+        if isinstance(first, Exception) or first is None:
+            stop.set()
+            raise HTTPException(500, f"synthesis failed: {first}" if first else "synthesis produced no audio")
+        headers = {"X-Sample-Rate": str(timing["rate"]), "X-Voice": profile["id"], "X-Preset": preset_name,
+                   "X-Lock-Wait-Seconds": f"{timing.get('lock_wait', 0):.3f}", "X-AI-Generated": "true"}
+
+        async def body():
+            try:
+                yield first
+                while (item := await queue.get()) is not None:
+                    if isinstance(item, Exception):
+                        return  # mid-stream failure: end the audio; the client hears it stop
+                    yield item
+            finally:
+                stop.set()  # the client disconnected, or the stream finished
+
+        return StreamingResponse(body(), media_type="audio/L16", headers=headers)
+
     @app.exception_handler(VoiceError)
     async def voice_error(_, exc: VoiceError):
         return JSONResponse({"detail": str(exc)}, status_code=409)
@@ -398,10 +555,20 @@ def main() -> None:
         with st.lock:
             backend = st.ensure_loaded()
             profile = st.profiles.active()
-            if profile:  # first audio decode compiles kernels (RTF ~4.5); do it before the first real request
+            if profile:  # the first synthesis is slow (kernel loading); do it before the first real request
                 cache, _ = st.prompt_for(backend, profile)
-                backend.generate("Warming up the voice.", cache, PRESETS[settings.tts_preset], 42)
+                for _ in stream_generate(backend, "Warming up the voice.", cache, PRESETS[settings.tts_preset], 42):
+                    pass  # the streaming path, which is what the voice loop uses
                 backend.synchronize()
+            print(f"Voice model on {getattr(backend, 'description', {}).get('gpu')}", flush=True)
+        if settings.asr_backend == "service":
+            t0 = time.perf_counter()
+            asr = app.state.asr_model()
+            rng = np.random.default_rng(0)
+            for seconds in (1, 3, 6, 10):  # kernels load per input shape: the first real 5 s utterance took 5 s otherwise
+                asr.readings((rng.standard_normal(16000 * seconds) * 0.01).astype(np.float32),
+                             ("hi", "en"), {"en": settings.asr_prompt, "hi": settings.asr_prompt_hi})
+            print(f"Speech recognition ({settings.asr_model}) ready in {time.perf_counter() - t0:.1f} s", flush=True)
     port = args.port or int(settings.tts_url.rsplit(":", 1)[1])
     uvicorn.run(app, host="127.0.0.1", port=port, log_level="info")
 

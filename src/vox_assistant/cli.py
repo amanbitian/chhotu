@@ -28,7 +28,31 @@ def _agent(settings: Settings, confirm):
 
     audit = AuditLog(settings.audit_db)
     registry, store = build_registry(settings)
-    return Agent(_llm(settings), registry, PermissionGate(confirm, audit), audit, name=settings.assistant_name), store
+    return Agent(_llm(settings), registry, PermissionGate(confirm, audit), audit, name=settings.assistant_name,
+                 gender=settings.hindi_self_gender), store
+
+
+def _neutral_tts(settings: Settings):
+    """The Windows voice, plus a way to speak Hindi neutrally (see NeutralVoiceTTS)."""
+    from .tts_client import ClonedVoiceTTS
+    from .tts_neutral import NeutralVoiceTTS
+
+    hindi = None
+    if settings.neutral_voice_profile and (settings.voices_dir / settings.neutral_voice_profile).is_dir():
+        hindi = ClonedVoiceTTS(settings.tts_url, voice=settings.neutral_voice_profile, preset=settings.tts_preset)
+    return NeutralVoiceTTS(hindi=hindi, hindi_voice=settings.neutral_hindi_voice or None)
+
+
+def _asr(settings: Settings):
+    """GPU recognition in the voice service (English + Hindi), the CPU recogniser as fallback (English)."""
+    from .asr_local import LocalWhisperASR
+
+    cpu = LocalWhisperASR(settings.whisper_model, settings.whisper_device, settings.whisper_compute, settings.whisper_threads)
+    if settings.asr_backend != "service":
+        return cpu
+    from .asr_remote import ServiceASR
+
+    return ServiceASR(settings.tts_url, fallback=cpu)
 
 
 def cmd_devices(args, settings) -> int:
@@ -46,7 +70,9 @@ def cmd_enroll(args, settings) -> int:
     from .enroll import run_interactive
 
     try:
-        profile = run_interactive(VoiceProfiles(settings.voices_dir), args.name, settings.input_device, settings.silero_model)
+        name = args.name or ("me-hi" if args.language == "hi" else "me")
+        profile = run_interactive(VoiceProfiles(settings.voices_dir), name, settings.input_device, settings.silero_model,
+                                  language=args.language)
     except VoiceError as exc:
         print(f"Not saved: {exc}")
         return 1
@@ -103,10 +129,13 @@ def cmd_say(args, settings) -> int:
         from .tts_neutral import NeutralVoiceTTS
 
         tts = NeutralVoiceTTS() if args.neutral else ClonedVoiceTTS(settings.tts_url, preset=args.preset or settings.tts_preset)
+        speaker = None if args.out else Speaker(settings.output_device)
         pcm = b""
         try:
             async for chunk in tts.synth(text):
                 pcm += chunk
+                if speaker:
+                    speaker.play(chunk, tts.sample_rate)  # play while the rest is still being generated
         except (httpx.HTTPError, RuntimeError) as exc:
             print(f"Could not synthesize: {exc}\nIs the voice service running (scripts\\start_tts.ps1)? Use --neutral for the Windows voice.")
             return 1
@@ -117,8 +146,6 @@ def cmd_say(args, settings) -> int:
             Path(args.out).write_bytes(labelled_wav(pcm, tts.sample_rate, voice))
             print(f"Wrote {args.out} (labelled as AI-generated speech)")
         else:
-            speaker = Speaker(settings.output_device)
-            speaker.play(pcm, tts.sample_rate)
             await speaker.drain()
             speaker.close()
         return 0
@@ -136,10 +163,13 @@ def cmd_ask(args, settings) -> int:
         except EOFError:  # no terminal to ask on: decline
             return False
 
+    from .language import reply_language
+
     agent, _ = _agent(settings, confirm)
+    text = " ".join(args.text)
 
     async def go() -> int:
-        async for ev in agent.run(" ".join(args.text)):
+        async for ev in agent.run(text, reply_language(args.language or settings.language, text)):
             if isinstance(ev, Say):
                 print(ev.text, end="", flush=True)
             elif isinstance(ev, ToolStarted):
@@ -194,6 +224,8 @@ def cmd_listen(args, settings) -> int:
             print(f"\n  ({k}{': ' + str({a: b for a, b in ev.items() if a != 'kind'}) if len(ev) > 1 else ''})")
         elif k == "wake":
             print(f"\n  (listening - {ev['via']})")
+        elif k == "language":
+            print(f"\n  (language: {ev['mode']})")
 
     async def go() -> int:
         import threading
@@ -201,9 +233,11 @@ def cmd_listen(args, settings) -> int:
         from .hotkey import GlobalHotkey
         from .tools.knowledge import warm_index
 
+        if args.language:
+            settings.language = args.language
         threading.Thread(target=warm_index, args=(settings,), name="notes-index", daemon=True).start()
         agent, store = _agent(settings, None)
-        asr = LocalWhisperASR(settings.whisper_model, settings.whisper_device, settings.whisper_compute, settings.whisper_threads)
+        asr = _asr(settings)
         spotter = LocalWhisperASR(settings.wake_spotter_model, settings.whisper_device, settings.whisper_compute, 4) \
             if settings.wake_spotter_model and not args.always else None
         print("Loading speech recognition…")
@@ -214,7 +248,7 @@ def cmd_listen(args, settings) -> int:
         except httpx.HTTPError:
             print("Cloned-voice service is not running; using the neutral voice. Start scripts\\start_tts.ps1 for your voice.")
             cloned = None
-        loop = VoiceLoop(agent=agent, asr=asr, tts=cloned, neutral_tts=NeutralVoiceTTS(), speaker=Speaker(settings.output_device),
+        loop = VoiceLoop(agent=agent, asr=asr, tts=cloned, neutral_tts=_neutral_tts(settings), speaker=Speaker(settings.output_device),
                          vad=SileroVAD(settings.silero_model), settings=settings, reminders=store, spotter=spotter,
                          mode="always" if args.always else "wake", on_event=show)
         hotkey = None
@@ -277,6 +311,18 @@ def cmd_doctor(args, settings) -> int:
     try:
         h = httpx.get(f"{settings.tts_url}/health", timeout=3.0).json()
         line(True, f"cloned-voice service {settings.tts_url}", "model loaded" if h["model_loaded"] else "up (model loads on first request)")
+        voice_gpu = (h.get("runtime") or {}).get("gpu") or ""
+        try:  # a Dual_gpu lane with a model on the same card: Windows pages one of them out of VRAM when both are used
+            st = httpx.get(f"{settings.dual_gpu_url}/api/status", timeout=3.0).json()
+            hw = httpx.get(f"{settings.dual_gpu_url}/api/hardware", timeout=3.0).json()
+            from .tools.system import summarize_gpus
+
+            shared = [g for g in summarize_gpus(hw, st, settings.gpu_temp_limit_c) if g["model"] and g["gpu"] == voice_gpu]
+            if shared:
+                line(None, "voice model shares a GPU", f"{voice_gpu} also runs {shared[0]['model']}: when both are busy "
+                     "the voice is ~1-2 s slower and the lane can be left partly in system RAM (see README)")
+        except Exception:
+            pass
     except httpx.HTTPError:
         line(None, f"cloned-voice service {settings.tts_url}", "not running (scripts\\start_tts.ps1); neutral voice still works")
     active = VoiceProfiles(settings.voices_dir).active()
@@ -322,7 +368,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("devices", help="list audio devices").set_defaults(fn=cmd_devices)
     p = sub.add_parser("enroll", help="record a voice reference with a guided script")
-    p.add_argument("--name", default="me")
+    p.add_argument("--name", default=None, help="default: me (English), me-hi (Hindi)")
+    p.add_argument("--language", choices=["en", "hi"], default="en",
+                   help="the language you read in; a Hindi reference is used for Hindi speech")
     p.set_defaults(fn=cmd_enroll)
     p = sub.add_parser("voices", help="list / switch / delete / score voice profiles")
     p.add_argument("action", nargs="?", choices=["list", "use", "revoke", "check"], default="list")
@@ -334,13 +382,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--preset", choices=["Draft", "Balanced", "Quality"])
     p.add_argument("--out", help="write a WAV instead of playing")
     p.set_defaults(fn=cmd_say)
+    languages = ["auto", "en", "hi", "hinglish"]
     p = sub.add_parser("ask", help="send one typed request to the agent")
     p.add_argument("text", nargs="+")
+    p.add_argument("--language", choices=languages, help="reply language (default: setting `language`)")
     p.set_defaults(fn=cmd_ask)
     sub.add_parser("serve", help="open the local web app").set_defaults(fn=cmd_serve)
     sub.add_parser("llm-server", help="run the assistant's own small LLM (llama-server)").set_defaults(fn=cmd_llm_server)
     p = sub.add_parser("listen", help="hands-free voice assistant")
     p.add_argument("--always", action="store_true", help="treat every utterance as a request (no wake phrase)")
+    p.add_argument("--language", choices=languages, help="reply language to start with; switch any time by voice")
     p.set_defaults(fn=cmd_listen)
     sub.add_parser("doctor", help="check that every part is reachable").set_defaults(fn=cmd_doctor)
     args = parser.parse_args(argv)

@@ -100,6 +100,89 @@ def test_warm_touches_the_model_only_when_loaded_and_wav_is_labelled(client):
     assert client.post("/warm", json={}).json()["warmed"] is True and client.backend.generated[-1] == "Okay."
 
 
+class _T:
+    """Just enough of a torch tensor for stream_generate."""
+
+    def __init__(self, a):
+        self.a = a
+
+    def squeeze(self, _):
+        return self
+
+    def float(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        return self.a
+
+
+class _Torch:
+    import contextlib
+
+    seeds: list = []
+
+    @staticmethod
+    def manual_seed(s):
+        _Torch.seeds.append(s)
+
+    inference_mode = staticmethod(contextlib.nullcontext)
+
+
+class StreamingBackend(FakeBackend):
+    """Like VoxCPM2: the model yields one ~0.16 s piece per decoded latent patch."""
+
+    torch = _Torch
+
+    def __init__(self):
+        super().__init__()
+        outer = self
+
+        class Model:
+            def generate_with_prompt_cache_streaming(self, target_text, prompt_cache, inference_timesteps, cfg_value, max_len):
+                outer.generated.append(target_text)
+                for _ in range(3):
+                    yield _T(np.full(outer.sample_rate * 16 // 100, 0.1, dtype=np.float32)), None, None
+
+        self.model = Model()
+
+
+def test_pcm_is_streamed_piece_by_piece_and_wav_stays_whole(settings):
+    backend = StreamingBackend()
+    c = TestClient(create_app(settings, backend_factory=lambda: backend))
+    VoiceProfiles(settings.voices_dir).create("me", tone(), 16000, "hello there", permission_confirmed=True)
+    with c.stream("POST", "/audio/speech", json={"input": "One. Two."}) as r:
+        pieces = [p for p in r.iter_bytes() if p]
+        assert r.headers["x-sample-rate"] == "24000" and float(r.headers["x-lock-wait-seconds"]) >= 0
+    assert sum(len(p) for p in pieces) == 2 * 3 * (24000 * 16 // 100) * 2  # two sentences x three pieces
+    assert backend.generated == ["One.", "Two."]
+    w = c.post("/audio/speech", json={"input": "One.", "response_format": "wav"})
+    assert w.status_code == 200 and backend.generated[-1] == "One."  # whole-sentence path (FakeBackend.generate)
+    settings.tts_stream = False
+    c2 = TestClient(create_app(settings, backend_factory=lambda: backend))
+    assert c2.post("/audio/speech", json={"input": "One."}).status_code == 200  # the old whole-sentence pcm path
+
+
+def test_a_failing_model_is_an_http_error_not_an_empty_stream(settings):
+    class Broken(StreamingBackend):
+        def __init__(self):
+            super().__init__()
+
+            class Model:
+                def generate_with_prompt_cache_streaming(self, **kw):
+                    raise RuntimeError("GPU fell over")
+                    yield
+
+            self.model = Model()
+
+    c = TestClient(create_app(settings, backend_factory=Broken))
+    VoiceProfiles(settings.voices_dir).create("me", tone(), 16000, "hello there", permission_confirmed=True)
+    r = c.post("/audio/speech", json={"input": "Hello."})
+    assert r.status_code == 500 and "GPU fell over" in r.json()["detail"]
+
+
 def test_validation(client):
     enroll(client)
     assert client.post("/audio/speech", json={"input": "  "}).status_code == 400

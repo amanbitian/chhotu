@@ -21,6 +21,18 @@ SCRIPT = [
     "That's great news, thank you so much. Let's try that again, a little slower this time.",
     "Honestly, I wasn't sure it would work, but it sounds exactly like I'd say it.",
 ]
+# The same for a Hindi reference: everyday speech, a question, numbers, English technical words as they are said in
+# Hindi, and the retroflex and aspirated sounds (ट ड ढ ठ, ख घ छ झ थ ध फ भ) that an English recording cannot teach.
+SCRIPT_HI = [
+    "नमस्ते, आज सुबह से मौसम काफ़ी अच्छा है, और मुझे थोड़ा जल्दी निकलना है।",
+    "क्या आप बता सकते हैं कि अभी कौन सा मॉडल ग्राफ़िक्स कार्ड पर चल रहा है?",
+    "तापमान लगभग पैंसठ डिग्री है, और पंखे की आवाज़ बहुत धीमी है।",
+    "प्रोजेक्ट वाला फ़ोल्डर खोलिए और पिछली बार वाली फ़ाइल ढूँढ़िए।",
+    "मुझे लगता है कि गलती validator में है, एक field छूट गया है।",
+    "तीस मिनट बाद मुझे प्रिंट देखने की याद दिलाना, और फिर नोट्स का सार बताना।",
+    "बहुत बढ़िया, धन्यवाद! चलिए इसे एक बार फिर से, थोड़ा धीरे करते हैं।",
+    "सच कहूँ तो मुझे भरोसा नहीं था, पर यह बिल्कुल मेरी तरह ही सुनाई देता है।",
+]
 TARGET_SECONDS = (20.0, 36.0)  # stop once past the low end; never exceed the high end
 
 
@@ -74,7 +86,7 @@ def record_take(frames, vad, *, max_seconds: float = 14.0, end_silence_ms: int =
     return np.frombuffer(b"".join(kept), dtype=np.int16).astype(np.float32) / 32768.0
 
 
-def run_interactive(profiles: VoiceProfiles, name: str, input_device, silero_path: Path) -> dict:
+def run_interactive(profiles: VoiceProfiles, name: str, input_device, silero_path: Path, language: str = "en") -> dict:
     """Terminal enrollment. Needs a microphone; the decisions live in the testable helpers above."""
     import queue
 
@@ -93,16 +105,18 @@ def run_interactive(profiles: VoiceProfiles, name: str, input_device, silero_pat
         while True:
             yield q.get()
 
-    print(f"\nEnrolling voice '{name}'. Speak in your normal voice, in a quiet room, at a steady distance from the mic.")
+    script = SCRIPT_HI if language == "hi" else SCRIPT
+    print(f"\nEnrolling voice '{name}' ({'Hindi' if language == 'hi' else 'English'}). Speak in your normal voice, in a "
+          "quiet room, at a steady distance from the mic.")
     print("For each line: press Enter, then read it aloud naturally. Recording stops when you pause.\n")
     takes: list[Take] = []
     with stream:
-        for text in SCRIPT:
+        for text in script:
             total = sum(len(t.audio) for t in takes) / REF_RATE
             if total >= TARGET_SECONDS[0]:
                 break
             while True:
-                print(f"  [{len(takes) + 1}/{len(SCRIPT)}]  \"{text}\"")
+                print(f"  [{len(takes) + 1}/{len(script)}]  \"{text}\"")
                 input("  Press Enter, then speak... ")
                 while not q.empty():
                     q.get_nowait()
@@ -121,5 +135,5 @@ def run_interactive(profiles: VoiceProfiles, name: str, input_device, silero_pat
     audio, transcript = assemble(takes)
     print(f"Joined {len(takes)} takes into {len(audio) / REF_RATE:.1f} s of reference.")
     answer = input("I confirm this is my own voice, or I have the speaker's permission to clone it (yes/no): ").strip().lower()
-    return profiles.create(name, audio, REF_RATE, transcript, permission_confirmed=answer in ("y", "yes"),
-                           source="guided enrollment")
+    return profiles.create(name, audio, REF_RATE, transcript, permission_confirmed=answer in ("y", "yes", "haan", "हाँ"),
+                           source="guided enrollment", language=language)

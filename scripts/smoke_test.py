@@ -31,7 +31,9 @@ from vox_assistant.config import Settings
 from vox_assistant.permissions import PermissionGate
 from vox_assistant.tools import build_registry
 from vox_assistant.tts_neutral import NeutralVoiceTTS
-from vox_assistant.voice import CHIME, VoiceLoop, strip_wake_phrase
+from vox_assistant.voice import CHIME, VoiceLoop
+
+from language_eval import strip_wake  # the voice loop's per-reading wake-phrase check
 from vox_assistant.voices import VoiceProfiles
 
 RESULTS: list[tuple[str, str, str]] = []
@@ -209,8 +211,8 @@ async def check_audio_devices(settings: Settings) -> None:
         spk.close()
 
 
-async def check_speech_chain(settings: Settings, asr: LocalWhisperASR) -> dict:
-    print("\n4. Speech chain: Windows TTS -> Silero VAD -> Whisper -> wake phrase")
+async def check_speech_chain(settings: Settings, asr) -> dict:
+    print("\n4. Speech chain: Windows TTS -> Silero VAD -> Whisper (GPU, Hindi + English) -> wake phrase")
     phrase = "Hey Vox, which models are running on the graphics cards, and are the temperatures safe?"
     speech = await say_pcm16k(phrase)
     vad = SileroVAD(settings.silero_model)
@@ -222,10 +224,86 @@ async def check_speech_chain(settings: Settings, asr: LocalWhisperASR) -> dict:
     t0 = time.perf_counter()
     text = await asr.transcribe(speech, prompt="Hey vox.")
     took = time.perf_counter() - t0
-    record("PASS" if "temperature" in text.lower() else "FAIL", "Whisper transcript", f"{text!r} ({took:.2f} s for {len(speech)/32000:.1f} s of speech)")
-    rest = strip_wake_phrase(text, [settings.wake_phrase, *settings.wake_aliases])
+    backend = getattr(asr, "last_backend", "cpu")
+    record("PASS" if "temperature" in text.lower() and backend == "service" else ("WARN" if "temperature" in text.lower() else "FAIL"),
+           f"Whisper transcript ({'GPU service' if backend == 'service' else 'CPU fallback'})",
+           f"{text!r} ({took:.2f} s for {len(speech)/32000:.1f} s of speech)")
+    rest = strip_wake(text, [settings.wake_phrase, *settings.wake_aliases])
     record("PASS" if rest else "FAIL", "wake phrase recognised", f"request = {rest!r}")
+    cpu = LocalWhisperASR(settings.whisper_model, settings.whisper_device, settings.whisper_compute, settings.whisper_threads)
+    await cpu.warm()
+    t0 = time.perf_counter()
+    fallback = await cpu.transcribe(speech, prompt="Hey vox.")
+    record("PASS" if "temperature" in fallback.lower() else "FAIL", "CPU fallback recogniser (if the voice service is down)",
+           f"{time.perf_counter() - t0:.2f} s")
     return {"speech": speech}
+
+
+async def say_hindi_pcm16k(settings: Settings, text: str) -> bytes | None:
+    """Hindi speech for the 'person' (Windows has no Hindi voice here): the voice service, trimmed like say_pcm16k."""
+    import io
+
+    import soundfile as sf
+
+    try:
+        async with httpx.AsyncClient(base_url=settings.tts_url, timeout=120) as c:
+            r = await c.post("/audio/speech", json={"input": text, "response_format": "wav"})
+            r.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    audio, rate = sf.read(io.BytesIO(r.content), dtype="float32")
+    y = resample_poly(audio, SAMPLE_RATE, rate) * 32767
+    loud = np.flatnonzero(np.abs(y) > 300)
+    if len(loud):
+        y = y[loud[0]: loud[-1] + int(0.05 * SAMPLE_RATE)]
+    return y.astype(np.int16).tobytes()
+
+
+async def check_hindi(settings: Settings, asr, tmp: Path, cloned) -> None:
+    print("\n5b. Hindi and Hinglish, in real time: spoken Hindi request -> tool -> Hindi answer; switching by voice")
+    speech = await say_hindi_pcm16k(settings, "हे वॉक्स, मेरे ग्राफ़िक्स कार्ड का तापमान क्या है?")
+    if speech is None:
+        record("SKIP", "Hindi voice loop", "the voice service is needed to produce Hindi speech")
+        return
+    spotter = LocalWhisperASR(settings.wake_spotter_model, settings.whisper_device, settings.whisper_compute, 4)
+    await spotter.warm()
+
+    async def ask(feeder, loop, events, spk):
+        await wait_for(lambda: len(loop._acks) >= 1, 60, "acknowledgements to be prepared")
+        feeder.say(speech)
+        await wait_for(lambda: loop._turn is not None and loop._turn.done(), 90, "the turn to finish")
+        await wait_for(lambda: spk.seconds() > 0.5, 30, "audio")
+
+    out = await run_loop(settings, asr, tmp, ask, cloned=cloned, spotter=spotter, realtime=True)
+    ev = [e for _, e in out["events"]]
+    heard = next((e["text"] for e in ev if e["kind"] == "heard"), "")
+    said = "".join(e["text"] for e in ev if e["kind"] == "say")
+    tools = [e["name"] for e in ev if e["kind"] == "tool_result"]
+    record("PASS" if heard else "FAIL", "Hindi speech heard", heard.replace("\n", " | ")[:120])
+    record("PASS" if "gpu_status" in tools else "FAIL", "Hindi request understood (gpu_status)", str(tools))
+    hindi = sum("ऀ" <= ch <= "ॿ" for ch in said) > len(said) / 3
+    record("PASS" if hindi else "FAIL", "answered in Hindi (auto language)", said[:120])
+    latency_report(out, "cloned voice", "Hindi, one tool")
+
+    switch = await say_pcm16k("Hey Vox, Hindi mein baat karo.")
+    question = await say_pcm16k("Hey Vox, what is the capital of France?")
+
+    async def switching(feeder, loop, events, spk):
+        feeder.say(switch)
+        await wait_for(lambda: any(e["kind"] == "language" for _, e in events), 30, "the language switch")
+        await asyncio.sleep(3)
+        feeder.say(question)
+        await wait_for(lambda: loop._turn is not None and loop._turn.done(), 60, "the turn to finish")
+
+    out = await run_loop(settings, asr, tmp, switching, cloned=cloned)
+    ev = [e for _, e in out["events"]]
+    modes = [e["mode"] for e in ev if e["kind"] == "language"]
+    said = "".join(e["text"] for e in ev if e["kind"] == "say")
+    heard = [e["text"].replace("\n", " | ") for e in ev if e["kind"] == "heard"]
+    record("PASS" if modes == ["hi"] else "FAIL", "\"Hindi mein baat karo\" switches the language (handled locally)",
+           f"{modes}; heard {heard[:1]}")
+    record("PASS" if sum("ऀ" <= ch <= "ॿ" for ch in said) > len(said) / 3 else "FAIL",
+           "an English question is then answered in Hindi", said[:100])
 
 
 async def run_loop(settings: Settings, asr: LocalWhisperASR, tmp: Path, scenario, *, cloned=None, spotter=None,
@@ -263,6 +341,36 @@ async def run_loop(settings: Settings, asr: LocalWhisperASR, tmp: Path, scenario
     return {"events": events, "speaker": spk, "asr_calls": asr_calls, "audit": audit, "feeder": feeder, "loop": loop}
 
 
+def latency_report(out: dict, voice: str, label: str) -> None:
+    """What the user waits for: from the last voiced frame they said to the first audible sample of the answer (and of
+    the "let me check" acknowledgement), with a timeline of the stages in between."""
+    if not out["feeder"].speech_fed_at:
+        return
+    end = out["feeder"].speech_fed_at[0]
+    spk: CapturingSpeaker = out["speaker"]
+    ack_sizes = {len(pcm) for clips in out["loop"]._acks.values() for pcm, _ in clips}
+    ack_plays = [p for p in spk.plays if p[1] in ack_sizes and p[0] >= end]
+    answer_plays = [p for p in spk.plays if p[1] != len(CHIME) and p[1] not in ack_sizes and p[0] >= end]
+    if ack_plays:
+        record("PASS" if ack_plays[0][0] - end < 2.0 else "WARN", f"[{label}] end of speech -> first sound (\"let me check\", {voice})",
+               f"{ack_plays[0][0] - end:.2f} s")
+    if not answer_plays:
+        record("FAIL", f"[{label}] answer audio", "none played")
+        return
+    lat = answer_plays[0][0] - end
+    record("PASS" if lat <= 2.0 else "WARN", f"[{label}] end of speech -> first audio of the answer ({voice})", f"{lat:.2f} s (target 1-2 s)")
+    heard = next((t for t, e in out["events"] if e["kind"] == "heard" and t >= end), None)
+    used_asr = max((t for t in out["asr_calls"] if heard is None or t <= heard), default=None)  # the transcript used
+    steps = [f"asr start {used_asr - end:+.2f}"] if used_asr else []
+    for t, e in out["events"]:
+        if t >= end and e["kind"] in ("heard", "tool", "tool_result", "ack", "say"):
+            steps.append(f"{e['kind']}{'(' + e['name'] + ')' if 'name' in e else ''} +{t - end:.2f}")
+            if e["kind"] == "say":
+                break
+    steps.append(f"first audio +{lat:.2f}")
+    print(f"      [{label}] timeline after end of speech: " + ", ".join(steps))
+
+
 async def check_voice_loop(settings: Settings, asr: LocalWhisperASR, speech: bytes, tmp: Path, cloned, quick: bool = False) -> None:
     voice = "cloned voice" if cloned else "neutral voice"
     print(f"\n5. Voice loop, hands-free, in real time: spoken question -> live LLM + gpu_status -> spoken answer ({voice})")
@@ -289,29 +397,21 @@ async def check_voice_loop(settings: Settings, asr: LocalWhisperASR, speech: byt
     record("PASS" if len(said) > 20 else "FAIL", "answer produced", said[:160].replace("\n", " "))
     spk: CapturingSpeaker = out["speaker"]
     record("PASS" if spk.seconds() > 1.0 else "FAIL", "answer synthesized to audio", f"{spk.seconds():.1f} s")
-    ack_sizes = {len(pcm) for clips in out["loop"]._acks.values() for pcm, _ in clips}
-    ack_plays = [p for p in spk.plays if p[1] in ack_sizes]
-    answer_plays = [p for p in spk.plays if p[1] != len(CHIME) and p[1] not in ack_sizes]  # chime and "let me check"
-    if ack_plays and out["feeder"].speech_fed_at:
-        record("PASS" if ack_plays[0][0] - out["feeder"].speech_fed_at[0] < 2.0 else "WARN",
-               f"end of speech -> first sound (\"let me check\", {voice})", f"{ack_plays[0][0] - out['feeder'].speech_fed_at[0]:.2f} s")
-    if answer_plays and out["feeder"].speech_fed_at:
-        # From the last frame of speech the user said, through the VAD's end-of-turn silence, ASR, the LLM and its tool
-        # call, to the first audio of the answer: what the user waits for.
-        end = out["feeder"].speech_fed_at[0]
-        lat = answer_plays[0][0] - end
-        record("PASS" if lat < 3.0 else "WARN", f"end of speech -> first audio of the answer ({voice})", f"{lat:.2f} s (target 1-2 s)")
-        steps = [f"asr start +{out['asr_calls'][0] - end:.2f}"] if out["asr_calls"] else []
-        for t, e in out["events"]:
-            if t >= end and e["kind"] in ("heard", "tool", "tool_result", "ack", "say"):
-                steps.append(f"{e['kind']}{'(' + e['name'] + ')' if 'name' in e else ''} +{t - end:.2f}")
-                if e["kind"] == "say":
-                    break
-        steps.append(f"first audio +{lat:.2f}")
-        print("      timeline after end of speech: " + ", ".join(steps))
-        first_say = next((e["text"] for _, e in out["events"] if e["kind"] == "say"), "")
-        print(f"      first text chunk: {first_say[:100]!r}")
+    latency_report(out, voice, "two read tools")
     record("PASS" if any(r["tool"] == "gpu_status" and r["decision"] == "auto" for r in out["audit"].recent()) else "FAIL", "audit log has the read-only call")
+
+    plain = await say_pcm16k("Hey Vox, what is the capital of France?")
+
+    async def ask_plain(feeder, loop, events, spk):
+        await wait_for(lambda: len(loop._acks) >= (2 if cloned else 1), 60, "acknowledgements to be prepared")
+        feeder.say(plain)
+        await wait_for(lambda: loop._turn is not None and loop._turn.done(), 60, "the turn to finish")
+        await wait_for(lambda: spk.seconds() > 0.5, 30, "audio")
+
+    out = await run_loop(settings, asr, tmp, ask_plain, cloned=cloned, spotter=spotter, realtime=True)
+    said = "".join(e["text"] for _, e in out["events"] if e["kind"] == "say")
+    record("PASS" if "paris" in said.lower() else "FAIL", "question without tools answered", said[:80])
+    latency_report(out, voice, "no tools")
     if quick:
         return
 
@@ -376,6 +476,15 @@ async def check_web(settings: Settings, tmp: Path) -> None:
             record("PASS" if r.status_code == 200 and r.content[:4] == b"RIFF" and len(r.content) > 20000 else "FAIL", "neutral speech as WAV", f"{len(r.content)} bytes")
             r = await c.post("/api/speak", json={"text": "hello", "voice_mode": "cloned"})
             record("PASS" if r.status_code in (200, 503, 409) else "FAIL", "cloned speech path", f"HTTP {r.status_code}: {(r.json().get('detail') if r.status_code != 200 else 'audio')[:90]}")
+            t0, first, total = time.perf_counter(), None, 0
+            async with c.stream("POST", "/api/speak/stream", json={"text": "Streaming the answer to the page.", "voice_mode": "cloned"}) as s:
+                rate = s.headers.get("x-sample-rate")
+                async for chunk in s.aiter_bytes():
+                    first = first or time.perf_counter() - t0
+                    total += len(chunk)
+            ok_stream = s.status_code == 200 and rate and total > 0
+            record("PASS" if ok_stream else ("SKIP" if s.status_code in (503, 409) else "FAIL"), "page speech streams (cloned)",
+                   f"first bytes after {first:.2f} s, {total / 2 / int(rate):.1f} s of audio at {rate} Hz" if ok_stream else f"HTTP {s.status_code}")
             evs = []
             async with c.stream("POST", "/api/chat", json={"text": "How much RAM is my PC using right now?"}) as resp:
                 async for line in resp.aiter_lines():
@@ -423,7 +532,9 @@ async def main() -> int:
     if not quick:
         check_gpu_torch(settings)
         await check_audio_devices(settings)
-    asr = LocalWhisperASR(settings.whisper_model, settings.whisper_device, settings.whisper_compute, settings.whisper_threads)
+    from vox_assistant.cli import _asr
+
+    asr = _asr(settings)  # what `vox listen` uses: GPU recognition in the voice service, CPU as fallback
     await asr.warm()
     chain = await check_speech_chain(settings, asr)
     from vox_assistant.tts_client import ClonedVoiceTTS
@@ -434,6 +545,7 @@ async def main() -> int:
     except httpx.HTTPError:
         cloned = None
     await check_voice_loop(settings, asr, chain["speech"], tmp, cloned, quick=quick)
+    await check_hindi(settings, asr, tmp, cloned)
     if not quick:
         await check_web(settings, tmp)
         await check_real_clone(settings, asr)

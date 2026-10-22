@@ -134,6 +134,17 @@ async def main() -> int:
                 record(d["other_speaker_similarity"] < d["similarity"] - 0.1, "clone is clearly not the other speaker",
                        f"{d['other_speaker_similarity']:.3f} vs David ({time.perf_counter() - t0:.1f} s incl. model load)")
 
+            # The same voice speaking Hindi (from an English recording): still the same person?
+            r = await c.post(f"/voices/{zira['id']}/similarity", json={
+                "compare_with": david["id"], "sentence": "दोनों ग्राफ़िक्स कार्ड का तापमान 52 डिग्री है, सब ठीक है।"})
+            if r.status_code == 200:
+                d = r.json()
+                record(d["same_speaker"] and d["other_speaker_similarity"] < d["similarity"] - 0.1,
+                       "clone speaking Hindi is still the same speaker",
+                       f"{d['similarity']:.3f} own vs {d['other_speaker_similarity']:.3f} other")
+            else:
+                record(False, "Hindi similarity", f"HTTP {r.status_code}: {r.text[:150]}")
+
             r = await c.post("/warm", json={})
             record(r.status_code == 200, "warm endpoint", str(r.json()))
         finally:

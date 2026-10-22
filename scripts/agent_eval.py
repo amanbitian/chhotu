@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import shutil
 import sys
 import tempfile
 import time
 from pathlib import Path
 
+from vox_assistant import language
 from vox_assistant.agent import Agent, Say, ToolFinished, claims_action
 from vox_assistant.audit import AuditLog
 from vox_assistant.config import Settings
@@ -50,15 +52,42 @@ CASES = [
     ("Run my status check workflow.", {"run_workflow"}),
     ("Ask the coding agent to add unit tests to the VoxVortex project.", {"delegate_coding_task"}),
     ("Search the web for ROCm 7.2 release notes.", {"web_search"}),
+    # Hindi (Devanagari) and Hinglish (as typed, Latin letters); auto mode must answer in the same language
+    ("मेरे ग्राफ़िक्स कार्ड का तापमान क्या है?", {"gpu_status"}),
+    ("नोटपैड खोलो।", {"open_app"}),
+    ("दस मिनट बाद मुझे पानी पीने की याद दिलाना।", {"set_reminder"}),
+    ("भारत की राजधानी क्या है?", set()),
+    ("मेरी स्क्रीन पर क्या दिख रहा है?", {"look_at_screen"}),
+    ("mere GPU ka temperature check karo", {"gpu_status"}),
+    ("Notepad open kar do", {"open_app"}),
+    ("RAM kitni use ho rahi hai?", {"system_info"}),
+    ("Cutline project VS Code mein kholo", {"open_project"}),
+    ("web pe ROCm release notes search karo", {"web_search"}),
 ]
 
 
-async def run_case(agent: Agent, text: str) -> dict:
+def language_ok(lang: str, reply: str) -> bool:
+    """Did the reply come in the right language and script? Hindi: mostly Devanagari; English: none; Hinglish: some
+    Devanagari, or Hindi words in Latin letters."""
+    import re
+
+    dev = len(re.findall(r"[ऀ-ॿ]", reply))
+    letters = dev + len(re.findall(r"[A-Za-z]", reply))
+    if not letters:
+        return True
+    if lang == "en":
+        return dev == 0
+    if lang == "hi":
+        return dev / letters >= 0.5
+    return dev > 0 or language.detect(reply) == "hinglish"
+
+
+async def run_case(agent: Agent, text: str, reply_lang: str = "en") -> dict:
     agent.reset()
     t0 = time.perf_counter()
     first_say = None
     tools, said = [], ""
-    async for ev in agent.run(text):
+    async for ev in agent.run(text, reply_lang):
         if isinstance(ev, Say):
             first_say = first_say or time.perf_counter() - t0
             said += ev.text
@@ -87,28 +116,32 @@ async def main() -> int:
     llm = ToolChoiceLLM(args.url, args.model, temperature=0.3, timeout=120.0, first_token_timeout=90.0)
     agent = Agent(llm, registry, PermissionGate(decline, audit), audit)
     await run_case(agent, "Hello.")  # load / warm the model so the first case is not a cold start
-    good = total = 0
+    good = total = lang_misses = 0
     firsts: list[float] = []
     print(f"Model at {args.url}")
     for text, want in CASES:
+        lang = language.reply_language("auto", text)
         for _ in range(args.reps):
             asked.clear()
-            r = await run_case(agent, text)
+            r = await run_case(agent, text, lang)
             first = r["tools"][0][0] if r["tools"] else None
             ok_tool = (first in want) if want else first is None
             # A declined action must not be reported as done.
-            false_claim = any(d == "denied" for _, d in r["tools"]) and claims_action(r["said"].split(".")[0])
-            ok = ok_tool and not false_claim
+            false_claim = any(d == "denied" for _, d in r["tools"]) and claims_action(re.split(r"[.।]", r["said"])[0])
+            ok_lang = language_ok(lang, r["said"])
+            ok = ok_tool and not false_claim and ok_lang
+            lang_misses += not ok_lang
             good += ok
             total += 1
             if r["first_say"]:
                 firsts.append(r["first_say"])
             fs = f"{r['first_say']:.2f}s" if r["first_say"] else "  -  "
-            print(f"  {'ok ' if ok else 'BAD'} {fs} {r['total']:5.2f}s  {text[:44]:44s} tools={r['tools']}  "
-                  f"{'FALSE-CLAIM ' if false_claim else ''}{r['said'][:70]!r}", flush=True)
+            print(f"  {'ok ' if ok else 'BAD'} {fs} {r['total']:5.2f}s  [{lang:8s}] {text[:40]:40s} tools={r['tools']}  "
+                  f"{'FALSE-CLAIM ' if false_claim else ''}{'WRONG-LANGUAGE ' if not ok_lang else ''}{r['said'][:70]!r}",
+                  flush=True)
     firsts.sort()
     median = firsts[len(firsts) // 2] if firsts else float("nan")
-    print(f"\n{good}/{total} correct; median time to first words {median:.2f}s")
+    print(f"\n{good}/{total} correct ({lang_misses} in the wrong language); median time to first words {median:.2f}s")
     await llm.aclose()
     audit.close()
     store.close()

@@ -21,6 +21,10 @@ class ReminderStore:
         with self._lock:
             self._db.execute("CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY, due REAL, text TEXT,"
                              " state TEXT DEFAULT 'pending')")
+            try:  # added in 0.2: when a reminder was claimed for speaking
+                self._db.execute("ALTER TABLE reminders ADD COLUMN claimed_at REAL")
+            except sqlite3.OperationalError:
+                pass
             self._db.commit()
 
     def add(self, text: str, in_minutes: float) -> dict:
@@ -35,12 +39,29 @@ class ReminderStore:
             rows = self._db.execute("SELECT id, due, text FROM reminders WHERE state='pending' ORDER BY due").fetchall()
         return [{"id": i, "due": d, "text": t, "due_local": datetime.fromtimestamp(d).strftime("%H:%M")} for i, d, t in rows]
 
+    _DUE = ("SELECT id, due, text FROM reminders WHERE (state='pending' AND due<=?) "
+            "OR (state='claimed' AND claimed_at<=?)")
+    CLAIM_TIMEOUT_S = 120.0
+
     def due(self) -> list[dict]:
-        """Return and mark as fired every reminder whose time has come."""
+        """Return and mark as fired every reminder whose time has come (the web page: delivered once it is returned)."""
+        return self._take("fired")
+
+    def claim_due(self) -> list[dict]:
+        """Return due reminders and mark them claimed; call `mark_fired` once one has been spoken. A claim older than
+        two minutes (the process died before speaking) makes the reminder due again, so it is not lost."""
+        return self._take("claimed")
+
+    def mark_fired(self, reminder_id: int) -> None:
+        with self._lock:
+            self._db.execute("UPDATE reminders SET state='fired' WHERE id=?", (reminder_id,))
+            self._db.commit()
+
+    def _take(self, state: str) -> list[dict]:
         now = self._clock()
         with self._lock:
-            rows = self._db.execute("SELECT id, due, text FROM reminders WHERE state='pending' AND due<=?", (now,)).fetchall()
-            self._db.executemany("UPDATE reminders SET state='fired' WHERE id=?", [(r[0],) for r in rows])
+            rows = self._db.execute(self._DUE, (now, now - self.CLAIM_TIMEOUT_S)).fetchall()
+            self._db.executemany("UPDATE reminders SET state=?, claimed_at=? WHERE id=?", [(state, now, r[0]) for r in rows])
             self._db.commit()
         return [{"id": i, "due": d, "text": t} for i, d, t in rows]
 

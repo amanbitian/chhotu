@@ -30,7 +30,21 @@ class Settings:
     tts_preset: str = "Draft"
     # "driver": use the display driver's amdhip64_7.dll (the wheel's copy crashes with current drivers); "bundled": the wheel's.
     tts_hip_runtime: str = "driver"
-    # ASR: faster-whisper on the CPU by default, so the GPUs stay free for the LLM and the voice.
+    # MIOpen (AMD's convolution library) crashes on streaming decode's tiny shapes here; PyTorch's own convs are as fast.
+    tts_miopen: bool = False
+    tts_stream: bool = True  # pcm responses stream ~0.16 s pieces as generated (False: whole sentences)    # Language: "auto" (reply in the language you speak), "en", "hi" (Hindi, Devanagari) or "hinglish". Any language is
+    # understood in every mode; this sets how the assistant answers. Switch by voice ("Hindi mein baat karo").
+    language: str = "auto"
+    # ASR: Whisper large-v3-turbo on the GPU in the voice service, decoding Hindi and English together ("service");
+    # "cpu" = faster-whisper `whisper_model` below (English only with small.en; also the fallback if the service is down).
+    asr_backend: str = "service"
+    asr_model: str = "openai/whisper-large-v3-turbo"
+    asr_device: str = ""  # GPU name fragment / cuda:N; "" = same GPU as the voice model
+    # Spelling hints for Whisper's English decode: the wake phrase and words people say to this assistant. Measured:
+    # English wake phrase 16/18 -> 18/18 with it. The Hindi decode gets no prompt by default: any prompt (English, or
+    # Devanagari) made it drift into Latin letters and understood fewer Hindi requests (13/18 -> 10-11/18).
+    asr_prompt: str = "Hey Vox. Notepad, VS Code, GPU, RAM, CPU, temperature, model, reminder, clipboard, project."
+    asr_prompt_hi: str = ""
     whisper_model: str = "small.en"
     whisper_device: str = "cpu"
     whisper_compute: str = "int8"
@@ -43,7 +57,18 @@ class Settings:
     gpu_temp_limit_c: int = 90
     wake_phrase: str = "hey vox"
     # How Whisper tends to spell the wake phrase; matched exactly like wake_phrase.
-    wake_aliases: list[str] = field(default_factory=lambda: ["hey box", "hey vaux", "hey vocs", "hey vogs"])
+    # Includes the spellings Whisper produced for "hey vox" in Hindi / Hinglish speech (scripts/language_eval.py).
+    wake_aliases: list[str] = field(default_factory=lambda: [
+        "hey box", "hey vaux", "hey vocs", "hey vogs", "hey wax", "hey walks", "hey wox", "haywalks",
+        "हे वॉक्स", "हे वाक्स", "हे वोक्स", "हे वक्स", "है वॉक्स", "है वाक्स", "है वोक्स", "है वक्स", "हेई वाक्स",
+        "हेवाक्स", "हेवॉक्स"])
+    # Hindi verb forms the assistant uses for itself: "neutral" (avoids gendered forms), "male" or "female".
+    hindi_self_gender: str = "neutral"
+    # The neutral (non-cloned) voice in Hindi. Windows here has no Hindi voice, so Hindi goes to the voice service with
+    # this synthetic reference (Audio Clone's demo voice, not a real person). With the Windows Hindi speech pack
+    # installed, set neutral_hindi_voice = "Microsoft Kalpana Desktop" (or Hemant) to use it instead.
+    neutral_voice_profile: str = "demo_v1"
+    neutral_hindi_voice: str = ""
     # A small Whisper run on the partial utterance while you are still speaking, so the wake chime comes quickly.
     wake_spotter_model: str = "tiny.en"  # "" disables spotting (the wake phrase is then found after the utterance ends)
     # Push-to-talk: wakes the assistant like the wake phrase; "" disables. Ctrl+Alt+Space is taken on this PC,

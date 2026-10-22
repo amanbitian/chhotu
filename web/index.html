@@ -71,8 +71,14 @@
     <h2>Assistant</h2>
     <div id="log" aria-live="polite"></div>
     <div class="row">
-      <input type="text" id="chatText" class="grow" placeholder="Ask about the GPUs, find a file, open an app…">
+      <input type="text" id="chatText" class="grow" placeholder="Ask anything, in English, हिन्दी or Hinglish…">
       <button id="send">Send</button>
+    </div>
+    <div class="row">
+      <select id="lang" aria-label="Reply language" style="width:auto">
+        <option value="auto">Auto (match me)</option><option value="en">English</option>
+        <option value="hi">हिन्दी</option><option value="hinglish">Hinglish</option>
+      </select>
       <label class="meta"><input type="checkbox" id="speakReplies"> speak replies</label>
     </div>
   </section>
@@ -81,7 +87,8 @@
     <h2>Voice profiles</h2>
     <div id="voices" class="meta">Loading…</div>
     <details style="margin-top:12px"><summary>Add a voice from a WAV file</summary>
-      <div class="row"><input type="text" id="vName" class="grow" placeholder="name, e.g. me"></div>
+      <div class="row"><input type="text" id="vName" class="grow" placeholder="name, e.g. me">
+        <select id="vLang" aria-label="Recording language" style="width:auto"><option value="en">spoken in English</option><option value="hi">spoken in Hindi</option></select></div>
       <div class="row"><input type="file" id="vFile" accept="audio/wav,.wav"></div>
       <div class="row"><textarea id="vText" placeholder="Exact words spoken in the recording (20–30 s of clean speech works best)"></textarea></div>
       <div class="row"><label class="meta"><input type="checkbox" id="vConsent"> This is my own voice, or I have the speaker's permission to clone it.</label></div>
@@ -98,6 +105,10 @@
 
 <script>
 const $ = id => document.getElementById(id);
+// The reply-language choice is remembered on this browser; until chosen, it follows the `language` setting.
+let langChosen = false;
+try { const saved = localStorage.getItem('voxLang'); if (saved) { $('lang').value = saved; langChosen = true; } } catch (_) {}
+$('lang').addEventListener('change', () => { langChosen = true; try { localStorage.setItem('voxLang', $('lang').value); } catch (_) {} });
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function api(path, body) {
   const opt = body === undefined ? {} : { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) };
@@ -113,18 +124,23 @@ async function refresh() {
     $('pills').innerHTML = p(s.llm.ok, 'LLM ' + esc(s.llm.ok ? s.llm.model : 'offline')) +
       p(s.tts.ok, s.tts.ok ? (s.tts.model_loaded ? 'voice ready' : 'voice service up (model loads on first use)') : 'cloned voice offline') +
       `<span class="pill">${esc(s.active_voice || 'no voice profile')}</span>`;
-    renderVoices(s.voices, s.active_voice);
+    if (!langChosen) $('lang').value = s.language || 'auto';
+    renderVoices(s.voices, s.active_voice, s.active_voice_hi);
   } catch (e) { $('pills').innerHTML = `<span class="pill bad">${esc(e.message)}</span>`; }
   const a = await (await api('/api/audit?limit=15')).json();
   $('audit').querySelector('tbody').innerHTML = '<tr><th>When</th><th>What</th><th>Decision</th><th>Result</th></tr>' +
     a.events.map(e => `<tr><td>${new Date(e.ts*1000).toLocaleTimeString()}</td><td>${esc(e.tool || e.kind)}</td><td>${esc(e.decision)}</td><td>${esc(e.summary)}</td></tr>`).join('');
 }
 
-function renderVoices(list, active) {
+function renderVoices(list, active, activeHi) {
+  // A voice recorded in Hindi is used for Hindi speech; the main (English) voice for everything else.
+  const tag = v => v.id === active ? '<span class="pill ok">active</span>' :
+    (v.id === activeHi ? '<span class="pill ok">active for Hindi</span>' : '');
+  const inUse = v => v.id === active || v.id === activeHi;
   $('voices').innerHTML = list.length ? list.map(v => `
-    <div class="voice"><div class="grow"><b>${esc(v.id)}</b> ${v.id === active ? '<span class="pill ok">active</span>' : ''}
-      <div class="meta">${v.quality.seconds.toFixed(0)} s · SNR ${v.quality.snr_db.toFixed(0)} dB · ${esc(v.source)}</div></div>
-      ${v.id === active ? '' : `<button class="ghost" data-act="${esc(v.id)}">Use</button>`}
+    <div class="voice"><div class="grow"><b>${esc(v.id)}</b> ${tag(v)}
+      <div class="meta">${(v.language || 'en') === 'hi' ? 'Hindi' : 'English'} · ${v.quality.seconds.toFixed(0)} s · SNR ${v.quality.snr_db.toFixed(0)} dB · ${esc(v.source)}</div></div>
+      ${inUse(v) ? '' : `<button class="ghost" data-act="${esc(v.id)}">Use</button>`}
       <button class="danger" data-rev="${esc(v.id)}">Delete</button></div>`).join('') :
     'No voice profile yet. Run <code>vox enroll</code>, or add a WAV below.';
 }
@@ -152,9 +168,11 @@ function add(cls, text) { const d = document.createElement('div'); d.className =
 async function send() {
   const text = $('chatText').value.trim(); if (!text) return;
   $('chatText').value = ''; add('msg user', text); $('send').disabled = true;
-  let bot = null, said = '';
+  voice.stop();
+  let bot = null, said = '', pending = '';
+  const speakOn = $('speakReplies').checked;
   try {
-    const r = await api('/api/chat', { text });
+    const r = await api('/api/chat', { text, language: $('lang').value });
     const reader = r.body.getReader(), dec = new TextDecoder(); let buf = '';
     for (;;) {
       const { value, done } = await reader.read(); if (done) break;
@@ -163,9 +181,15 @@ async function send() {
     }
   } catch (e) { add('chip bad', e.message); }
   $('send').disabled = false;
-  if (said && $('speakReplies').checked) speakText(said);
+  if (speakOn && pending.trim()) voice.say(pending);
   function handle(ev) {
-    if (ev.type === 'say') { if (!bot) bot = add('msg bot', ''); said += ev.text; bot.textContent = said; log.scrollTop = log.scrollHeight; }
+    if (ev.type === 'say') {
+      if (!bot) bot = add('msg bot', ''); said += ev.text; bot.textContent = said; log.scrollTop = log.scrollHeight;
+      if (speakOn) {  // speak each sentence as soon as it is complete, not the whole reply at the end
+        pending += ev.text; let m;
+        while ((m = pending.match(/^[\s\S]*?[.!?](\s+|$)/)) && m[1]) { voice.say(m[0]); pending = pending.slice(m[0].length); }
+      }
+    }
     else if (ev.type === 'tool') { bot = null; add('chip', `${ev.name} ${JSON.stringify(ev.args)} (${ev.risk})`); }
     else if (ev.type === 'tool_result') add('chip ' + (ev.ok ? 'ok' : 'bad'), `${ev.name}: ${ev.ok ? 'done' : 'not done'}${ev.detail ? ' — ' + ev.detail : ''} [${ev.decision}]`);
     else if (ev.type === 'confirm_request') askConfirm(ev);
@@ -183,17 +207,46 @@ function askConfirm(ev) {
   });
   log.appendChild(d); log.scrollTop = log.scrollHeight;
 }
-async function speakText(text) {
-  try { const r = await api('/api/speak', { text, voice_mode: $('voiceMode').value, preset: 'Draft' }); const a = new Audio(URL.createObjectURL(await r.blob())); a.play(); }
-  catch (e) { add('chip bad', 'speech: ' + e.message); }
-}
+// Streamed speech: each sentence is fetched as raw PCM and every chunk is scheduled the moment it arrives, so the first
+// words play while the rest is still being synthesized. Sentences are fetched one after another and queue up seamlessly.
+const voice = {
+  ctx: null, head: 0, chain: Promise.resolve(), gen: 0, sources: [],
+  say(text) {
+    const gen = this.gen;
+    this.chain = this.chain.then(() => gen === this.gen && this.stream(text, gen)).catch(e => add('chip bad', 'speech: ' + e.message));
+  },
+  stop() { this.gen++; this.sources.forEach(s => { try { s.stop(); } catch (_) {} }); this.sources = []; this.head = 0; },
+  async stream(text, gen) {
+    this.ctx = this.ctx || new AudioContext();
+    if (this.ctx.state === 'suspended') await this.ctx.resume();
+    const r = await fetch('/api/speak/stream', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ text, voice_mode: $('voiceMode').value, preset: 'Draft' }) });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+    const rate = +r.headers.get('X-Sample-Rate'), reader = r.body.getReader();
+    let carry = new Uint8Array(0);
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done || gen !== this.gen) { if (!done) reader.cancel(); break; }
+      const bytes = new Uint8Array(carry.length + value.length); bytes.set(carry); bytes.set(value, carry.length);
+      const n = bytes.length - (bytes.length % 2); carry = bytes.slice(n);
+      if (!n) continue;
+      const pcm = new Int16Array(bytes.buffer, 0, n / 2);
+      const buf = this.ctx.createBuffer(1, pcm.length, rate), ch = buf.getChannelData(0);
+      for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+      const src = this.ctx.createBufferSource(); src.buffer = buf; src.connect(this.ctx.destination);
+      this.head = Math.max(this.head, this.ctx.currentTime + 0.03); src.start(this.head); this.head += buf.duration;
+      this.sources.push(src); src.onended = () => { this.sources = this.sources.filter(s => s !== src); };
+    }
+  },
+};
+function speakText(text) { voice.say(text); }
 $('send').onclick = send; $('chatText').addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
 
 $('vAdd').onclick = async () => {
   const f = $('vFile').files[0]; $('vMsg').textContent = '';
   if (!f) { $('vMsg').textContent = 'Choose a WAV file.'; return; }
   const b64 = await new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(String(fr.result).split(',')[1]); fr.onerror = rej; fr.readAsDataURL(f); });
-  try { await api('/api/voices', { name: $('vName').value, transcript: $('vText').value, permission_confirmed: $('vConsent').checked, wav_base64: b64 }); $('vMsg').textContent = 'Saved and activated.'; refresh(); }
+  try { await api('/api/voices', { name: $('vName').value, transcript: $('vText').value, permission_confirmed: $('vConsent').checked, wav_base64: b64, language: $('vLang').value }); $('vMsg').textContent = 'Saved and activated.'; refresh(); }
   catch (e) { $('vMsg').textContent = e.message; }
 };
 async function pollReminders() {

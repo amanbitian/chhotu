@@ -3,7 +3,7 @@
 | | |
 | --- | --- |
 | Product | VoxVortex Desktop, a local voice assistant that speaks in the owner's cloned voice and acts on the PC with permission |
-| Version | 0.2.0 (second build: cloned voice working, P2 features, latency work) |
+| Version | 0.3.0 (English, Hindi and Hinglish; GPU speech recognition; on top of 0.2.1 streaming speech) |
 | Date | 2026-10-22 |
 | Platform | Windows 11 Pro, Python 3.12, Ryzen 9 9950X3D, Radeon AI PRO R9700 32 GB + RX 9070 XT 16 GB, Adrenalin 32.0.31036 |
 | Companion documents | [architecture.md](architecture.md) (how it works), [README.md](README.md) (how to run it) |
@@ -33,7 +33,7 @@
 
 **Purpose.** Give the owner a private, hands-free desktop agent: speak to it, it understands, checks or does things on the PC through controlled tools, and answers aloud in a synthetic copy of the owner's own voice, with all inference local.
 
-**In scope (this release).** Voice enrollment, versioned profiles, cloned speech on the GPU and a similarity check; hands-free voice loop with wake phrase, wake spotting, push-to-talk hotkey, interruption and spoken permission; typed chat and voice studio in a local web app; permissioned tools for GPU/host status, LLM workload control, files, notes search, apps, projects, coding-agent delegation, windows, screen understanding, web pages and search, clipboard, reminders and workflows; audit log; privacy controls (mute, neutral voice, guest mode with AI disclosure, revoke, labelled audio files).
+**In scope (this release).** English, Hindi and Hinglish throughout (understanding, answering, the cloned voice, confirmations, privacy commands), switchable instantly; voice enrollment (English and Hindi), versioned profiles, cloned speech on the GPU and a similarity check; hands-free voice loop with wake phrase, wake spotting, push-to-talk hotkey, interruption and spoken permission; typed chat and voice studio in a local web app; permissioned tools for GPU/host status, LLM workload control, files, notes search, apps, projects, coding-agent delegation, windows, screen understanding, web pages and search, clipboard, reminders and workflows; audit log; privacy controls (mute, neutral voice, guest mode with AI disclosure, revoke, labelled audio files).
 
 **Out of scope.** Ubuntu/Wayland control; clicking or typing inside web pages; Android companion; fine-tuned voices; multi-user hosting.
 
@@ -85,13 +85,18 @@
 | FR-25 | Disclose that speech is AI-generated: guest mode (neutral voice + spoken notice) and a label in every WAV written | spec §8 | Verified (unit; label read back from live service output) |
 | FR-26 | Measure clone similarity to the reference speaker | NFR-05 support | Verified live (`/voices/{id}/similarity`, `vox voices check`) |
 | FR-27 | Android companion | P3 | Not built |
+| FR-28 | Understand spoken and typed English, Hindi and Hinglish in every mode | owner request | Verified: spoken (synthetic speakers) understood 18/18 English, 15/18 Hindi, 14/18 Hinglish; typed 68/68 incl. 10 Hindi/Hinglish. **Needs a person** for native speech |
+| FR-29 | Answer in English, Hindi (Devanagari) or Hinglish: auto (follow the user) or a chosen mode | owner request | Verified (agent eval: 0 replies in the wrong language; smoke §5b: Hindi request answered in Hindi) |
+| FR-30 | Switch the reply language instantly: by voice, CLI, web selector, setting | owner request | Verified (unit; smoke §5b: "Hindi mein baat karo" heard as "हिंदी में बेत करो" still switches, the next English question is answered in Hindi) |
+| FR-31 | The cloned voice speaks Hindi and Hinglish, keeping the speaker's identity; optional Hindi reference | owner request | Verified on a synthetic speaker (0.972 own vs 0.441 other in Hindi from an English reference); Hindi enrollment script implemented; **owner's voice needs a person** |
+| FR-32 | Confirmations, privacy commands and the assistant's own phrases in Hindi / Hinglish, with the same safety rules | owner request | Verified (unit: yes/no incl. "मत करो", Hindi mute/guest mode, localized phrases; refused actions not re-asked) |
 
 ### 3.2 Non-functional
 
 | ID | Requirement | Target | Status |
 | --- | --- | --- | --- |
 | NFR-01 | No cloud AI requests during use | zero | Met by design (loopback clients; no cloud SDK). Not confirmed with a network monitor. `web_search` opens the user's own browser after approval |
-| NFR-02 | First audible response after end of speech | 1–2 s | **Partly met**: first sound 1.26–1.55 s (acknowledgement in the cloned voice); first audio of the researched answer 2.9–3.6 s; a no-tool answer starts after ASR + ~0.15 s + one clause of synthesis |
+| NFR-02 | First audible response after end of speech | 1–2 s | **Met**: plain English 0.93–1.04 s; Hindi with a tool 1.62–1.67 s; English with two tools 1.82–2.14 s (edge); acknowledgement 0.76–1.20 s. All with the 9070 XT lane idle; when it generates at the same time, +1–2 s (R2) |
 | NFR-03 | Wake reaction | < 300 ms | **Met in a different form**: the spotter (~140 ms per check, every 250 ms) acknowledges the wake phrase *while the user is still speaking* (3.5 s before the end of a 4.8 s request); the hotkey reacts in < 1 ms |
 | NFR-04 | Interruption stops audio promptly | ~64 ms after detection; detection 320 ms | Implemented; verified in scripted tests |
 | NFR-05 | Voice similarity | blind-listening test | **Measured on a synthetic speaker**: 0.978 to its own reference vs 0.474 to another speaker (threshold 0.86). **Needs a person** for the owner's voice and the listening test |
@@ -99,7 +104,7 @@
 | NFR-07 | Local services not drivable by a web page | loopback + header checks | Verified |
 | NFR-08 | Voice data under owner control | plain files, deletable | Verified |
 | NFR-09 | Degrade gracefully | fallback, apology | Verified |
-| NFR-10 | Maintainable, hardware-free tests | | 116 tests, no GPU/mic needed |
+| NFR-10 | Maintainable, hardware-free tests | | 157 tests, no GPU/mic needed |
 
 ## 4. Design decisions
 
@@ -110,7 +115,7 @@ D1–D15 from the first build stand (library reuse of VoxVortex, Windows first, 
 | D16 | **Own small voice LLM**: Qwen3.5-4B Q4_K_M + vision projector, own llama-server on the R9700 (:8083) | Keep the 27B lane (D5); load the 4B through Dual_gpu (would replace the 27B lane) | Measured 0.37 vs 1.37 s to first words, 24/24 vs 23/24 correct, 125 vs 26 tokens/s. The brief specified "Qwen 4B/8B" for this role. Fits beside the 27B (4.8 GB). The vision projector gives screen understanding. Not managed by Dual_gpu, so it is never evicted by it |
 | D17 | **Driver HIP runtime + TorchScript off** in the TTS process | Reinstall/downgrade ROCm wheels or the driver; disable the iGPU | Root-caused (finding 15): the wheel's runtime crashes with the installed driver; the driver's works. A pre-import DLL load fixes it without touching Audio Clone or the driver. The JIT's hipRTC also mismatched; disabling it costs a small speed-up in one activation |
 | D18 | **Voice model on the 9070 XT**, chosen by name | R9700 (the default choice of Audio Clone) | The R9700 cannot hold 27B + 4B + VoxCPM2; over-commit makes Windows page the idle model out (observed). Matches the brief's allocation. Contention remains with the 9070 XT Dual_gpu lane (R2) |
-| D19 | **`MIOPEN_FIND_MODE=FAST`** | Default find mode; pre-warm many lengths | Default: 10–25 s for each new sentence length; FAST: 2–4 s first time, ~20 % slower warm |
+| D19 | **`MIOPEN_FIND_MODE=FAST`**, then superseded by D27 | Default find mode; pre-warm many lengths | Default: 10–25 s for each new sentence length; FAST: 2–4 s first time, ~20 % slower warm |
 | D20 | **Wake spotter + hotkey** in addition to the transcript wake gate | openWakeWord (no "hey vox" model; training a custom one is a project of its own); push-to-talk only | tiny.en on the partial utterance acknowledges mid-sentence; unprompted it had 0/10 false wakes and 4/4 detections. The hotkey is the brief's push-to-talk option |
 | D21 | **Latency stack**: pre-warm on wake, keep-warm every 15 s, speculative ASR, parallel tool calls, eager first clause, cached acknowledgement, prompt-cache-stable system prompt, Whisper 8 threads | Bigger hardware changes; a different TTS | Each measured (architecture §16). Keep-warm trades ~2–3 % GPU time for avoiding a 1.5–2.6 s cold penalty; `keep_warm_s=0` turns it off |
 | D22 | **Acknowledgement only for read tools**, only from pre-synthesized audio | Always; synthesize on demand | An action is followed by a spoken confirmation question anyway; on-demand synthesis would delay the answer it is meant to cover |
@@ -118,6 +123,18 @@ D1–D15 from the first build stand (library reuse of VoxVortex, Windows first, 
 | D24 | **Workload control through Dual_gpu's client API**, destructive, lane-scoped, own lane protected | Start/stop llama-server directly | Dual_gpu owns the lanes and their admission checks; its documented client rules (never the bare unload) are followed |
 | D25 | **Coding agent in a visible console**, task via environment variable | Run headless (`opencode run`); `wt` | The owner watches and can stop it. `wt` drops argument quotes (finding 27); the env-var route also removes injection through task text |
 | D26 | **Speaker-verification score** (WavLM x-vector, CPU) as the automatic similarity check | ECAPA (speechbrain not installed); only listening | transformers is already in the TTS environment; documented 0.86 threshold. Supports, does not replace, the blind-listening test |
+| D27 | **Stream speech within sentences** using VoxCPM2's own streaming decode, with **MIOpen off** | Switch to Qwen3-TTS or Chatterbox (an earlier suggestion of mine, based on the wrong belief that VoxCPM2 could not stream); keep whole sentences | The installed model already streams; it crashed only through MIOpen, and PyTorch's convolutions are as fast. Same voice, no download: first audio 0.82 → 0.12 s |
+| D28 | **Trim the opening silence on the client**, first chunk of each utterance only | Trim in the service | The voice loop sends each sentence as its own request; trimming every request would erase the pauses between sentences |
+| D29 | **One fixed-rate speaker stream** (48 kHz) with stateful resampling | Reopen at each rate (old behaviour) | Reopening played queued audio at the wrong speed; 48 kHz is VoxCPM2's rate, so the cloned voice is never resampled |
+| D30 | **Concurrent read-only tools**; actions stay sequential | All sequential | Reads have no side effects and no approval; actions must be asked about one at a time |
+| D31 | **No GPU-priority queue** for speech | Use HIP high-priority streams | Measured: no effect across processes (2.43 vs 2.44 s under load); not shipped |
+| D32 | **Speech recognition on the GPU** in the voice service (Whisper large-v3-turbo, PyTorch ROCm) | CPU `small` / `medium` / `large-v3-turbo` (faster-whisper); whisper.cpp | CPU: `small` understood 7/18 Hindi; `medium`/turbo 1.9/2.7 s per decode. GPU turbo: 0.12–0.24 s per decode, Hindi good, and English faster than before. Costs 1.7 GB on the 9070 XT; CPU `small.en` stays as fallback |
+| D33 | **Decode every utterance as Hindi and as English**; English only when clearly English (confidence rule), else **both readings to the LLM** | Whisper language ID; pick the more confident reading | Language ID called most Hindi English; picking by confidence chose wrong in close cases (11/27); both readings understood best (English 18/18, Hindi 13→15/18, Hinglish 14/18) and the confidence rule keeps English answers in English |
+| D34 | **One assistant, reply language as a per-message tag** | Separate prompts or models per language | Instant switching, prompt cache kept, same tools and history |
+| D35 | **Hinglish written as Devanagari + English letters** for speech | Romanized Hinglish | VoxCPM2 reads Devanagari Hinglish slightly better; both acceptable, so the 4B's romanized replies are tolerated |
+| D36 | **Numbers per language** in the voice service (Hindi words / English words / as written) | VoxVortex's English normalizer for all | Measured: raw digits in Hindi misread; VoxVortex's normalizer mangled names in English |
+| D37 | **Same voice profile in both languages**, optional Hindi reference used for Devanagari text | Separate voice per language mandatory | An English reference already gives 0.972 similarity in Hindi |
+| D38 | **Neutral Hindi via the voice service with a synthetic reference** | Require the Windows Hindi speech pack | Nothing to install; a Windows Hindi voice can still be configured |
 
 ## 5. Design overview
 
@@ -144,7 +161,7 @@ Invariants:
 
 ## 7. Quality attributes
 
-**Performance.** Architecture §16 has every measurement. Headline (smoke test, real time, cloned voice, a question needing two tools): first sound 1.26–1.55 s, first audio of the answer 2.9–3.6 s (first build: 6.7–18 s with the neutral voice).
+**Performance.** Architecture §16 has every measurement. Headline (smoke test, real time, cloned voice, 9070 XT lane idle): a plain answer starts 1.36–1.40 s after the user stops speaking; one needing two tools 2.12–2.28 s, with "Let me check" at ~1.25 s (first build: 6.7–18 s with the neutral voice). With the 9070 XT lane generating at the same time: 2.4–3.3 s and 3.3–4.3 s (architecture §3).
 
 **Reliability.** Every dependency has a defined failure behaviour (architecture §14). The ROCm problem is now fixed at its cause; the process isolation (D4) remains.
 
@@ -156,33 +173,41 @@ Invariants:
 
 ## 8. Verification
 
-### 8.1 Automated tests (116, `pytest`, no GPU/microphone required)
+### 8.1 Automated tests (157, `pytest`, no GPU/microphone required)
+
+| File | Tests | Covers (language update) |
+| --- | ---: | --- |
+| `test_language.py` | 29 | reply-language detection incl. English words that look Hindi, spoken switches incl. misheard ones, Hindi/Hinglish yes/no with "no" winning, Hindi false claims, combining readings with the confidence rule, number words, per-language voices, script-based voice choice, `/asr`, CPU fallback, neutral Hindi |
+
+Also added: 3 voice-loop tests (Hindi wake phrase and auto reply; switching by voice then confirming in Hindi; Hindi refusal), 1 agent test (a refused action is not asked for again), 1 web test (reply language from the selector or from the user).
 
 | File | Tests | Covers |
 | --- | ---: | --- |
 | `test_voices.py` | 13 | versions, revoke, consent, id traversal, resampling, quality rules, clipping on raw input |
-| `test_tts_service.py` | 7 | splitting, voice resolution and revocation (plain DELETE), wav headers, streaming, prompt cache, validation, `/warm`, WAV label |
-| `test_agent.py` | 16 | gating, denial, pre-approval, errors, round limit, cancellation, history, cache-stable system prompt, time-stamped messages, prewarm |
+| `test_tts_service.py` | 9 | splitting, voice resolution and revocation (plain DELETE), wav headers, sentence and piece-by-piece streaming, failure before the first piece = HTTP 500, prompt cache, validation, `/warm`, WAV label |
+| `test_agent.py` | 18 | gating, denial, pre-approval, errors, round limit, cancellation, history, cache-stable system prompt, time-stamped messages, prewarm, concurrent reads (and history kept valid when interrupted) with sequential actions |
 | `test_guard.py` | 14 | claim detector and retry behaviour |
 | `test_llm_client.py` | 4 | `stop`, `tool_choice`, `parallel_tool_calls`, two tool calls parsed from one stream |
 | `test_tools.py` | 10 | first-build tools |
 | `test_desktop_tools.py` | 12 | hotkey parsing, window/project/lane/model matching, coding-agent command and launch line, load/unload through a mock Dual_gpu incl. own-lane refusal, notes search, workflows, full registry, WAV label, LLM server command, TTS device by name, config parsing |
-| `test_voice.py` | 23 | first-build loop behaviour plus wake spotting, false-wake rejection, hotkey, chime instead of "Yes?", guest mode (voice and notice), keep-warm, acknowledgements, speculative ASR, eager first clause |
-| `test_webapp.py` | 8 | page, guard, speak proxy, voices, chat, confirmation over a real server |
+| `test_voice.py` | 29 | first-build loop behaviour plus wake spotting, false-wake rejection, hotkey, chime instead of "Yes?", guest mode (voice and notice), keep-warm, acknowledgements, speculative ASR, eager first clause, opening-silence trim, seamless resampling, reminder claimed-then-fired |
+| `test_webapp.py` | 10 | page, guard, speak proxy, streamed page speech, voices, chat, confirmation over a real server |
 | `test_gaps.py` | 9 | enrollment helpers, TTS guard, executables refused, HTTP reminders, wake spellings |
 
 ### 8.2 Real-component scripts
 
 | Script | What it exercises | Latest result |
 | --- | --- | --- |
-| `scripts/smoke_test.py` | services; torch on the GPU via the driver runtime; mic and speaker; VAD, Whisper, wake phrase; real-time voice loop in the cloned voice with spotter, tools, acknowledgement and latency timeline; spoken permission refusal; mute; web app on a real socket; cloned speech round trip | **29 PASS, 0 FAIL, 1 WARN** (WARN: answer audio 3.59 s vs 1–2 s target) |
-| `scripts/clone_check.py` | enrollment through `record_take` with real VAD (synthetic speaker), cloning, labelled WAV, Whisper round trip, streamed first audio, similarity vs own and other speaker, `/warm`, revoke | **12 PASS, 0 FAIL** (similarity 0.978 vs 0.474; first new-voice synthesis 3.0 s, RTF 0.52; first streamed audio 0.82 s) |
-| `scripts/desktop_check.py --with-agent` | Notepad open/list/minimize/maximize/restore/focus/close, clipboard set/read/restore in full, projects, VS Code, web search, notes, screen, workflow, model catalog, coding agent | **17 PASS, 0 FAIL** |
-| `scripts/agent_eval.py` | 24 requests × 2 through the real agent and tools, actions declined | Qwen3.5-4B: 47/48, 0 false claims, 0.39 s median to first words. Qwen3.8-27B (first 12 requests): 23/24, 1.37 s |
+| `scripts/smoke_test.py` | services; torch on the GPU via the driver runtime; mic and speaker; VAD, GPU Whisper (and the CPU fallback), wake phrase; real-time voice loop in the cloned voice with spotter, tools, acknowledgement and latency timelines (two tools, no tools); **a spoken Hindi request answered in Hindi; switching language by voice**; spoken permission refusal; mute; web app incl. streamed page speech; cloned speech round trip | **40 PASS, 0 FAIL, 1 WARN** (WARN: English two-tool answer 2.14 s in that run, 1.82–1.89 s in others; no-tool 1.04 s; Hindi one-tool 1.67 s) |
+| `scripts/clone_check.py` | enrollment through `record_take` with real VAD (synthetic speaker), cloning, labelled WAV, Whisper round trip, streamed first audio, similarity vs own and other speaker **in English and in Hindi**, `/warm`, revoke | **13 PASS, 0 FAIL** (0.977 / 0.972 in Hindi vs 0.467 / 0.441 other; first streamed audio 0.09 s) |
+| `scripts/language_eval.py` | 18 spoken requests × 3 synthetic speakers × English / Hindi / Hinglish through the GPU recogniser, wake phrase per reading, real agent | wake 18/18 in every language; understood English 18/18 (CER 1.4 %), Hindi 15/18 (CER 23.5 %), Hinglish 14/18; 0.38–0.53 s per utterance |
+| `scripts/desktop_check.py --with-agent` | Notepad open/list/minimize/maximize/restore/focus/close, clipboard set/read/restore in full, projects, VS Code, web search, notes, screen, workflow, model catalog, coding agent | **17 PASS, 0 FAIL** (before the streaming update; the desktop tools did not change in it) |
+| `scripts/agent_eval.py` | 34 requests × 2 (incl. 10 typed Hindi / Hinglish) through the real agent and tools, actions declined; reply language checked | Qwen3.5-4B: **68/68**, 0 false claims, 0 replies in the wrong language, 0.38 s median. Qwen3.8-27B (first 12 requests): 23/24, 1.37 s |
+| Contention runs (smoke §5 with the 9070 XT lane generating back-to-back) | speech sharing a card with a working 27B; GPU priority on/off | no tools 2.43–3.27 s, two tools 3.28–4.28 s; priority queue no effect; lane at ~6 tokens/s with ~8 GB in system RAM |
 
 ### 8.3 Not verified (explicit)
 
-The owner's own voice (enrollment, similarity, blind listening); a person using `vox listen` with a microphone and speakers (echo, barge-in on real audio); live `load_model`/`unload_model` against the owner's running lanes; Hindi/Hinglish; behaviour under simultaneous load on the 9070 XT from the Dual_gpu lane and the voice model.
+The owner's own voice (enrollment in English and Hindi, similarity, blind listening); **native Hindi and Hinglish speech** (all Hindi measurements use synthetic speakers with English accents); a person using `vox listen` with a microphone and speakers (echo, barge-in on real audio); the web page's streamed speech heard in a real browser (the endpoint and the script's syntax are verified, the audible result is not); live `load_model`/`unload_model` against the owner's running lanes.
 
 ## 9. Traceability
 
@@ -205,7 +230,7 @@ The owner's own voice (enrollment, similarity, blind listening); a person using 
 | FR-24a–f | `test_desktop_tools`, desktop check, agent eval |
 | FR-25 | `test_voice` (guest mode), `test_desktop_tools` / `test_tts_service` (label), clone check (label on live output) |
 | FR-26, NFR-05 | clone check §3 |
-| NFR-02, NFR-03 | smoke §5 timeline, spotter and hotkey measurements |
+| NFR-02, NFR-03 | smoke §5 timelines (two tools, no tools), contention runs, spotter and hotkey measurements |
 | NFR-07 | `test_webapp`, `test_gaps`, `test_tts_service` (DELETE/POST rules), smoke §8 |
 
 ## 10. Review findings (defects found and fixed)
@@ -235,20 +260,46 @@ Findings 1–13 are from the first build (false "Notepad is open" claim, second 
 | 32 | Phone layout: a plain `1fr` grid column cannot shrink below its content | Low | headless Edge | `minmax(0,1fr)`, shrinkable rows; checked in a 375 px frame. (A first "overflow" screenshot was an artefact: headless Edge's minimum window is 504 px) |
 | 33 | Web status showed the configured model name "default"; it was inserted into the page unescaped | Low | screenshot | served model name, escaped |
 | 34 | Clone-check intelligibility test expected "seventy"; Whisper writes "70" | Low (test bug) | clone check | accept digits |
+| 35 | **Wrong claim in my own analysis**: I stated VoxCPM2 must finish a clause before playing and suggested a different TTS model. VoxCPM2 2.0.3 has a streaming decode | High (latency, advice) | an external review prompted a code check | stream with the installed model (D27) |
+| 36 | MIOpen crashes (access violation, any find mode) on streaming decode's small convolution shapes | Blocking for D27 | faulthandler | MIOpen off; PyTorch convolutions (`tts_miopen=false`) |
+| 37 | Every sentence starts with 0.29–0.46 s of near-silence | Medium (latency) | quality check of streamed audio | trim on the first chunk of each utterance (D28) |
+| 38 | Speaker reopened its stream at each new sample rate, so queued audio played at the wrong speed (chime → voice; voice → neutral fallback) | Medium | code review | fixed-rate stream + stateful resampler (D29) |
+| 39 | Keep-warm could fire while the user was speaking and hold the voice model as the answer needed it | Low (latency) | review of the warm-up logic | skip while an utterance is in progress |
+| 40 | Parallel tool calls from one reply still ran one after another | Low (latency) | smoke timeline | concurrent reads (D30); cancelled reads still answered in history |
+| 41 | A reminder was marked fired before it was spoken (R9) | Low | earlier risk list | claim → speak → mark fired; stale claims are due again |
+| 42 | The web page's "speak replies" waited for the whole reply, then synthesized it as one WAV | Medium (latency, web) | external review | `/api/speak/stream` + per-sentence Web Audio playback |
+| 43 | `vox say` downloaded the whole clip before playing | Low | review | plays as pieces arrive |
+| 44 | The smoke timeline's "asr start" showed a discarded speculative transcription (−3.8 s) | Low (test bug) | timeline review | report the transcription that was used |
+| 45 | Speech on the 9070 XT next to a working 27B: +1–2 s, and the 27B left partly in system RAM at ~6 tokens/s until reloaded | **High** (placement) | contention runs | measured and documented; `vox doctor` warns; placement options in README. Not changed without the owner (it is their lane configuration) |
+| 46 | GPU high-priority queues for speech | – | A/B under load | no effect; not shipped (D31) |
+| 47 | The word splitter used for wake phrase, yes/no and commands (`[a-z']+`) saw no words in Devanagari; Python's `\w` misses Devanagari vowel signs | Blocking for Hindi | design review | explicit Devanagari range without the danda |
+| 48 | Whisper language ID called most Hindi requests English, even `large-v3` | High | language probe | decode both languages (D33) |
+| 49 | Forced-Hindi decoding loops on English speech; an English prompt pushes the Hindi decode into Latin letters | Medium | probes | loop detection + length cap; no prompt on the Hindi decode |
+| 50 | English speech's Devanagari gibberish made auto-language answer an English question in Hindi | **High** | smoke §5b | Whisper-confidence rule in `combine()` |
+| 51 | "Hindi mein baat karo" from an English voice heard as "हिंदी में बेत करो": exact switch phrases missed it | Medium | smoke §5b | loose matching: one language name + a switch word, short, not a question |
+| 52 | Romanized-Hindi word list included English words (me, to, main, band), so "Remind me in ten minutes" was taken as Hinglish | Medium | agent eval | only words that are not English; strong verb forms count alone |
+| 53 | The 4B re-requested a refused Hindi reminder six times (six spoken questions), then apologised in English | **High** (UX, permissions) | agent eval | a refused tool is not run or asked again in that turn; give-up and refusal messages in the reply language |
+| 54 | Hindi digits were misread by the voice; VoxVortex's normalizer inserted English number words into Hindi | Medium | synthesize-and-transcribe probe | per-language normalization (D36) |
+| 55 | No Windows Hindi voice: the neutral voice could not speak Hindi | Medium | voice inventory | neutral Hindi through the voice service (D38) |
+| 56 | First GPU recognition after start took 5 s | Low | smoke | warm-up on 1/3/6/10 s inputs at start |
+| 57 | Clone-check, smoke and eval measured CER on the combined two-reading text, and the wake phrase on its start only | Low (test bugs) | review | per-reading CER and wake check |
 
 ## 11. Risks and open issues
 
 | ID | Risk / issue | Impact | Mitigation / next step |
 | --- | --- | --- | --- |
 | R1 | Driver/wheel drift: a future Adrenalin or ROCm wheel may change which HIP runtime works | Cloned voice stops | `tts_hip_runtime` switch; smoke §2 probes exactly the service's loading path |
-| R2 | 9070 XT shared between the voice model (~5–6 GB) and the Dual_gpu 27B Q3 lane (~14 GB) | Paging when both active: slow first requests | Keep that lane unloaded while talking, or use a smaller model there; the assistant can unload it by voice (destructive, asks) |
-| R3 | Answer audio 2.9–3.6 s vs 1–2 s | Conversational feel | Needs a TTS that streams within a sentence; compare Qwen3-TTS / Chatterbox behind the same `/audio/speech` contract (M1 comparison still open) |
+| R2 | 9070 XT shared between the voice model (~5–7 GB) and the Dual_gpu 27B Q3 lane (~14 GB) | **Measured**: speech +1–2 s while the lane works; the lane can be left partly in system RAM (~6 tokens/s) until reloaded | Owner's choice (README "Sharing the GPUs"): unload that lane while talking (the assistant can, destructive, asks), or shrink the R9700 lane's context so the voice stack fits beside it |
+| R3 | English answer with two tools 1.82–2.14 s vs 2 s | Small | Remaining levers: endpointing, fewer LLM rounds for tool questions |
+| R12 | Hindi / Hinglish accuracy measured only with synthetic, English-accented speakers (15/18, 14/18) | Unknown for the owner | Run `scripts/language_eval.py` style checks with real recordings; enroll a Hindi reference |
+| R13 | Speech recognition adds 1.7 GB to the 9070 XT | More contention with the 27B Q3 lane (R2) | `asr_device` can move it; `asr_backend = "cpu"` for English-only use |
+| R14 | Hindi replies sometimes use gendered self-reference; Hinglish often romanized | Style | `hindi_self_gender`; both scripts are spoken acceptably |
 | R4 | No echo cancellation | Self-hearing on speakers | Headset (A1) |
 | R5 | Claim guard is a first-sentence regex | Unusual phrasing slips through | Verifier pass or code-generated confirmations |
 | R6 | Small model on 26 tools | Occasional odd tool order | `scripts/agent_eval.py` before any model or tool change |
 | R7 | Keep-warm keeps the GPUs from idling down | A few watts while listening | `keep_warm_s = 0` |
 | R8 | Owner's voice not yet enrolled; listen/enroll not used by a person | Unknown UX defects | Owner steps in README |
-| R9 | Reminder marked fired before it is spoken | Lost on a crash at that instant | Mark after speech |
+| R9 | (closed) reminder marked fired before it was spoken | – | fixed: finding 41 |
 | R10 | `listen` and `serve` keep separate histories | Confusing context | One supervisor process later |
 | R11 | Coding agent's own permissions decide what it changes unasked | Unwanted edits | Configure OpenCode's permissions; it runs visibly and can be stopped |
 
@@ -271,18 +322,19 @@ Findings 1–13 are from the first build (false "Notepad is open" claim, second 
 | Personal knowledge | P3 | Done (notes full-text search) |
 | Voice-controlled automation | P3 | Done (workflows) |
 | Android companion | P3 | Not built |
+| English, Hindi and Hinglish, switchable (owner request after the brief) | – | Done: understanding, replies, cloned voice, confirmations, commands; native speech unmeasured |
 
-Performance objectives (brief §7): wake reaction met as mid-utterance acknowledgement / hotkey; first audible response 1.3–1.6 s (acknowledgement), answer 2.9–3.6 s; voice similarity 0.978 on a synthetic speaker (owner pending); interruption implemented; desktop operations confirmed from state where checkable; local processing met.
+Performance objectives (brief §7): wake reaction met as mid-utterance acknowledgement / hotkey; first audible response 1.36–1.40 s for plain answers, 2.12–2.28 s with tools (acknowledgement ~1.25 s), with the 9070 XT lane idle; voice similarity 0.978 on a synthetic speaker (owner pending); interruption implemented; desktop operations confirmed from state where checkable; local processing met.
 
 Security requirements (brief §8): consent, revoke, mute, neutral voice, no voice-as-authorization, **AI disclosure (guest mode, WAV labels)**: done.
 
-Milestones: M1 "prove your voice clone": the clone works and is scored; the Qwen3-TTS vs Chatterbox comparison is still open (R3). M2 integration: done. M3 desktop actions: done. M4 autonomous workflows: workflows and coding-agent delegation done; multi-step autonomous planning beyond configured workflows not built.
+Milestones: M1 "prove your voice clone": the clone works, streams, and is scored; the Qwen3-TTS vs Chatterbox comparison is no longer needed for latency and remains optional for quality. M2 integration: done. M3 desktop actions: done. M4 autonomous workflows: workflows and coding-agent delegation done; multi-step autonomous planning beyond configured workflows not built.
 
 ## 13. Operations
 
 **Run.** `scripts\start_all.ps1 [serve|listen]`, or separately `scripts\start_llm.ps1`, `scripts\start_tts.ps1`, `scripts\start.ps1 serve|listen`. `vox doctor` for reachability and environment problems.
 
-**Release check.** `pytest` (116 pass) → `smoke_test.py` (0 FAIL) → `clone_check.py` (0 FAIL) → `agent_eval.py` after any prompt, tool or model change → `desktop_check.py` after tool changes (visible side effects, all undone).
+**Release check.** `pytest` (157 pass) → `smoke_test.py` (0 FAIL) → `clone_check.py` (0 FAIL) → `agent_eval.py` after any prompt, tool or model change → `language_eval.py` after any recognition or language change → `desktop_check.py` after tool changes (visible side effects, all undone).
 
 **Recovery.** Bad voice version: `vox voices use <older id>`. Voice leak concern: `vox voices revoke <id>`. Runaway assistant: say "mute", or close the process. Cloned voice broken after a driver update: `VOXA_TTS_HIP_RUNTIME=bundled` to compare, then smoke §2.
 
@@ -302,3 +354,6 @@ Milestones: M1 "prove your voice clone": the clone works and is scored; the Qwen
 | RTF | Real-time factor: generation seconds ÷ audio seconds |
 | Speculative ASR | Transcribing at 200 ms of silence, used if the utterance then ends |
 | Spotter | Small Whisper reading the start of an utterance for the wake phrase |
+| Readings | The same utterance transcribed once as Hindi and once as English; both go to the LLM unless it was clearly English |
+| Hinglish | Hindi and English mixed in one sentence, as commonly spoken in India |
+| Reply language | The language the assistant answers in: the mode, or in auto mode the language the user used |

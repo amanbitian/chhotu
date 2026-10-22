@@ -73,26 +73,52 @@ class Microphone:
             self._stream = None
 
 
+OUT_RATE = 48000  # VoxCPM2's native rate, so the cloned voice is never resampled
+
+
+class Resampler:
+    """Linear-interpolation resampler for PCM16 that carries its phase and last sample across calls, so audio that
+    arrives in pieces (streamed speech) has no seams at the joins."""
+
+    def __init__(self, src: int, dst: int = OUT_RATE) -> None:
+        self.step = src / dst
+        self.pos = 1.0  # position of the next output sample; index 0 is the previous call's last sample
+        self.prev = 0.0
+
+    def __call__(self, pcm: bytes) -> bytes:
+        x = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+        if not len(x):
+            return b""
+        sig = np.concatenate([[self.prev], x])
+        t = np.arange(self.pos, len(x), self.step)
+        i = t.astype(np.int64)
+        f = t - i
+        out = sig[i] * (1 - f) + sig[np.minimum(i + 1, len(x))] * f
+        self.pos = (t[-1] + self.step - len(x)) if len(t) else self.pos - len(x)
+        self.prev = float(x[-1])
+        return np.clip(np.round(out), -32768, 32767).astype("<i2").tobytes()
+
+
 class Speaker:
-    """Plays PCM16 from a queue. `stop()` empties it, so playback ends within one audio block."""
+    """Plays PCM16 from a queue. `stop()` empties it, so playback ends within one audio block.
+
+    One output stream at a fixed rate; other rates are resampled on the way in. (Reopening the stream at each new
+    rate, as before, played whatever was still queued at the wrong speed: a 24 kHz chime followed by 48 kHz speech
+    finished the chime at double speed.)"""
 
     def __init__(self, device: str | int | None = None) -> None:
         self.device = resolve_device(device, "output")
         self._buf: deque[bytes] = deque()
         self._lock = threading.Lock()
         self._stream: sd.RawOutputStream | None = None
-        self._rate = 0
+        self._rate = OUT_RATE
+        self._resamplers: dict[int, Resampler] = {}
 
-    def _open(self, rate: int) -> None:
-        if self._stream and self._rate == rate:
-            return
-        if self._stream:
-            self._stream.stop()
-            self._stream.close()
-        self._rate = rate
-        self._stream = sd.RawOutputStream(samplerate=rate, channels=1, dtype="int16", device=self.device,
-                                          callback=self._fill, blocksize=1024)
-        self._stream.start()
+    def _open(self) -> None:
+        if self._stream is None:
+            self._stream = sd.RawOutputStream(samplerate=OUT_RATE, channels=1, dtype="int16", device=self.device,
+                                              callback=self._fill, blocksize=1024)
+            self._stream.start()
 
     def _fill(self, outdata, frames, time_info, status) -> None:
         need = frames * 2
@@ -108,18 +134,23 @@ class Speaker:
         outdata[:] = bytes(out) + b"\x00" * (need - len(out))
 
     def play(self, pcm: bytes, rate: int) -> None:
-        self._open(rate)
+        self._open()
+        if rate != OUT_RATE:
+            if self.pending_seconds == 0:  # a new piece of audio, not the continuation of one: start fresh
+                self._resamplers.pop(rate, None)
+            pcm = self._resamplers.setdefault(rate, Resampler(rate))(pcm)
         with self._lock:
             self._buf.append(pcm)
 
     @property
     def pending_seconds(self) -> float:
         with self._lock:
-            return sum(len(c) for c in self._buf) / 2 / (self._rate or 1)
+            return sum(len(c) for c in self._buf) / 2 / self._rate
 
     def stop(self) -> None:
         with self._lock:
             self._buf.clear()
+        self._resamplers.clear()
 
     async def drain(self) -> None:
         """Wait until everything queued has been handed to the device."""

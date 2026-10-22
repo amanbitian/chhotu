@@ -156,16 +156,30 @@ class VoiceProfiles:
         profile["path"] = str(self._dir(profile_id) / "reference.wav")
         return profile
 
-    def active_id(self) -> str | None:
+    # The state file holds the main active voice ("active", used for English and as the fallback) and optionally one
+    # per other language ("active_hi"): the same person can have a reference recorded in each language.
+    def _state(self) -> dict:
         state = self.root / "state.json"
-        if state.is_file():
-            active = json.loads(state.read_text(encoding="utf-8")).get("active")
+        return json.loads(state.read_text(encoding="utf-8")) if state.is_file() else {}
+
+    def _write_state(self, state: dict) -> None:
+        path = self.root / "state.json"
+        if state:
+            path.write_text(json.dumps(state), encoding="utf-8")
+        elif path.exists():
+            path.unlink()
+
+    def active_id(self, language: str | None = None) -> str | None:
+        state = self._state()
+        keys = ([f"active_{language}"] if language and language != "en" else []) + ["active"]
+        for key in keys:
+            active = state.get(key)
             if active and (self._dir(active) / "profile.json").is_file():
                 return active
         return None
 
-    def active(self) -> dict | None:
-        active = self.active_id()
+    def active(self, language: str | None = None) -> dict | None:
+        active = self.active_id(language)
         return self.get(active) if active else None
 
     # -- writing --------------------------------------------------------------------------
@@ -179,8 +193,10 @@ class VoiceProfiles:
         permission_confirmed: bool,
         activate: bool = True,
         source: str = "recording",
+        language: str = "en",
     ) -> dict:
-        """Validate, convert and store a reference as `<name>_v<N>`. Raises VoiceError on a bad recording."""
+        """Validate, convert and store a reference as `<name>_v<N>`. Raises VoiceError on a bad recording.
+        `language` is what the recording is spoken in; activating it makes it the voice for that language."""
         name = name.strip().lower()
         if not _NAME.match(name):
             raise VoiceError("Voice names use 1-32 lowercase letters, digits, '-' or '_'.")
@@ -210,6 +226,7 @@ class VoiceProfiles:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "permission_confirmed": True,
             "source": source,
+            "language": language,
             "quality": quality.as_dict(),
             "uuid": uuid.uuid4().hex,
         }
@@ -219,21 +236,25 @@ class VoiceProfiles:
         return profile
 
     def set_active(self, profile_id: str) -> None:
-        self.get(profile_id)
-        (self.root / "state.json").write_text(json.dumps({"active": profile_id}), encoding="utf-8")
+        """Make this the voice for its language (an English or untagged profile becomes the main voice)."""
+        lang = self.get(profile_id).get("language", "en")
+        state = self._state()
+        state["active" if lang == "en" or not state.get("active") else f"active_{lang}"] = profile_id
+        self._write_state(state)
 
     def revoke(self, profile_id: str) -> None:
-        """Delete a profile's recording and derived data. If it was active, fall back to the newest remaining one."""
+        """Delete a profile's recording and derived data. If it was the main voice, fall back to the newest remaining
+        one; if it was a language's voice, that language falls back to the main voice."""
         self.get(profile_id)
-        was_active = self.active_id() == profile_id
         shutil.rmtree(self._dir(profile_id))
-        if was_active:
+        state = self._state()
+        for key in [k for k, v in state.items() if v == profile_id]:
+            del state[key]
+        if "active" not in state:
             remaining = self.list()
-            state = self.root / "state.json"
             if remaining:
-                state.write_text(json.dumps({"active": remaining[-1]["id"]}), encoding="utf-8")
-            elif state.exists():
-                state.unlink()
+                state["active"] = remaining[-1]["id"]
+        self._write_state(state)
 
     def _dir(self, profile_id: str) -> Path:
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*_v\d+", profile_id or ""):

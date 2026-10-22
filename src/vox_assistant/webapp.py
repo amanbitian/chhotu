@@ -25,6 +25,7 @@ from .llm_client import ToolChoiceLLM
 
 from .agent import Agent, Say, ToolFinished, ToolStarted
 from .audit import AuditLog
+from . import language
 from .config import Settings
 from .disclosure import labelled_wav
 from .permissions import PermissionGate
@@ -45,6 +46,7 @@ class SpeakBody(BaseModel):
 
 class ChatBody(BaseModel):
     text: str
+    language: str | None = None  # auto / en / hi / hinglish; None = setting `language`
 
 
 class ConfirmBody(BaseModel):
@@ -57,6 +59,7 @@ class VoiceUpload(BaseModel):
     transcript: str
     permission_confirmed: bool
     wav_base64: str
+    language: str = "en"  # what the recording is spoken in: "en" or "hi"
 
 
 def create_app(settings: Settings | None = None, llm: Any = None, tts_transport: httpx.AsyncBaseTransport | None = None) -> FastAPI:
@@ -84,7 +87,17 @@ def create_app(settings: Settings | None = None, llm: Any = None, tts_transport:
         finally:
             pending.pop(cid, None)
 
-    agent = Agent(llm, registry, PermissionGate(confirm, audit), audit, name=settings.assistant_name)
+    agent = Agent(llm, registry, PermissionGate(confirm, audit), audit, name=settings.assistant_name,
+                  gender=settings.hindi_self_gender)
+
+    def neutral_tts() -> NeutralVoiceTTS:
+        """Windows voice; Hindi through the voice service with the synthetic neutral reference (no Windows Hindi voice)."""
+        from .tts_client import ClonedVoiceTTS
+
+        hindi = None
+        if settings.neutral_voice_profile and (settings.voices_dir / settings.neutral_voice_profile).is_dir():
+            hindi = ClonedVoiceTTS(settings.tts_url, voice=settings.neutral_voice_profile, preset=settings.tts_preset)
+        return NeutralVoiceTTS(hindi=hindi, hindi_voice=settings.neutral_hindi_voice or None)
     app = FastAPI(title="VoxVortex Desktop")
     app.state.agent, app.state.audit, app.state.reminders = agent, audit, reminders
 
@@ -115,8 +128,9 @@ def create_app(settings: Settings | None = None, llm: Any = None, tts_transport:
                 return {"ok": r.status_code == 200, "model": name, "served": served}
 
         t, l = await asyncio.gather(probe(tts()), probe(llm_up()))
-        return {"tts": t, "llm": l, "active_voice": profiles.active_id(), "voices": profiles.list(),
-                "tools": registry.names(), "pending_reminders": reminders.pending()}
+        return {"tts": t, "llm": l, "active_voice": profiles.active_id(), "active_voice_hi": profiles.active_id("hi"),
+                "voices": profiles.list(), "tools": registry.names(), "pending_reminders": reminders.pending(),
+                "language": settings.language}
 
     @app.post("/api/speak")
     async def speak(body: SpeakBody):
@@ -124,7 +138,7 @@ def create_app(settings: Settings | None = None, llm: Any = None, tts_transport:
         if not text:
             raise HTTPException(400, "Enter some text to speak.")
         if body.voice_mode == "neutral":
-            tts = NeutralVoiceTTS()
+            tts = neutral_tts()
             pcm = b"".join([c async for c in tts.synth(text)])
             return Response(labelled_wav(pcm, tts.sample_rate, "neutral"), media_type="audio/wav",
                             headers={"X-Voice": "neutral", "X-AI-Generated": "true"})
@@ -138,6 +152,40 @@ def create_app(settings: Settings | None = None, llm: Any = None, tts_transport:
         keep = {k: v for k, v in r.headers.items() if k.lower().startswith("x-")}
         return Response(r.content, media_type="audio/wav", headers=keep)
 
+    @app.post("/api/speak/stream")
+    async def speak_stream(body: SpeakBody):
+        """Raw PCM16 as it is synthesized (rate in X-Sample-Rate), for the page to play while the rest is generated.
+        `/api/speak` (a whole labelled WAV) stays for Generate/download."""
+        text = body.text.strip()
+        if not text:
+            raise HTTPException(400, "Nothing to speak.")
+        headers = {"X-AI-Generated": "true"}
+        if body.voice_mode == "neutral":
+            tts = neutral_tts()
+            pcm = b"".join([c async for c in tts.synth(text)])  # whole, so the rate header matches the engine used
+            return Response(pcm, media_type="audio/L16",
+                            headers={**headers, "X-Sample-Rate": str(tts.sample_rate), "X-Voice": "neutral"})
+        req = tts_http.build_request("POST", "/audio/speech", json={"input": text, "response_format": "pcm",
+                                                                   "preset": body.preset})
+        try:
+            resp = await tts_http.send(req, stream=True)
+        except httpx.HTTPError:
+            raise HTTPException(503, f"The cloned-voice service at {settings.tts_url} is not running.")
+        if resp.status_code != 200:
+            detail = (await resp.aread()).decode("utf-8", "replace")[:200]
+            await resp.aclose()
+            raise HTTPException(resp.status_code, detail)
+        headers.update({k: v for k, v in resp.headers.items() if k.lower() in ("x-sample-rate", "x-voice")})
+
+        async def relay():
+            try:
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+            finally:
+                await resp.aclose()  # the page stopped listening: closing tells the service to stop generating
+
+        return StreamingResponse(relay(), media_type="audio/L16", headers=headers)
+
     @app.post("/api/chat")
     async def chat(body: ChatBody):
         text = body.text.strip()
@@ -150,11 +198,15 @@ def create_app(settings: Settings | None = None, llm: Any = None, tts_transport:
         async def emit(ev: dict) -> None:
             await queue.put(ev)
 
+        mode = body.language if body.language in language.MODES else settings.language
+        reply_lang = language.reply_language(mode, text)
+
         async def work() -> None:
             async with turn_lock:
                 state["emit"] = emit
+                await emit({"type": "language", "mode": mode, "reply": reply_lang})
                 try:
-                    async for ev in agent.run(text):
+                    async for ev in agent.run(text, reply_lang):
                         if isinstance(ev, Say):
                             await emit({"type": "say", "text": ev.text})
                         elif isinstance(ev, ToolStarted):
@@ -197,14 +249,15 @@ def create_app(settings: Settings | None = None, llm: Any = None, tts_transport:
 
     @app.get("/api/voices")
     def voices():
-        return {"active": profiles.active_id(), "voices": profiles.list()}
+        return {"active": profiles.active_id(), "active_hi": profiles.active_id("hi"), "voices": profiles.list()}
 
     @app.post("/api/voices")
     def add_voice(body: VoiceUpload):
         try:
             audio, rate = sf.read(io.BytesIO(base64.b64decode(body.wav_base64)), dtype="float32", always_2d=True)
             profile = profiles.create(body.name, audio.mean(axis=1) if audio.shape[1] > 1 else audio[:, 0], rate,
-                                      body.transcript, permission_confirmed=body.permission_confirmed, source="web upload")
+                                      body.transcript, permission_confirmed=body.permission_confirmed, source="web upload",
+                                      language="hi" if body.language == "hi" else "en")
         except (VoiceError, RuntimeError, ValueError) as exc:
             raise HTTPException(400, str(exc))
         audit.record("voice", "create", "act", {"id": profile["id"]}, "user", ok=True)

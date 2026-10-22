@@ -202,9 +202,80 @@ async def test_user_messages_carry_their_time_and_history_is_not_rewritten(audit
     agent.clock = lambda: datetime(2026, 10, 22, 9, 5)
     await collect(agent, "first")
     agent.clock = lambda: datetime(2026, 10, 22, 9, 6)
-    await collect(agent, "second")
-    assert agent.history[0]["content"] == "[09:05] first" and agent.history[2]["content"] == "[09:06] second"
+    async for _ in agent.run("दूसरा", "hi"):
+        pass
+    assert agent.history[0]["content"] == "[09:05, reply in English] first"
+    assert agent.history[2]["content"] == "[09:06, reply in Hindi] दूसरा"
     assert llm.seen[1][:2] == llm.seen[0][:2]  # system prompt and first message unchanged a minute later
+
+
+async def test_several_read_calls_run_at_the_same_time_but_actions_stay_sequential(audit):
+    import time
+
+    async def slow_read(args):
+        await asyncio.sleep(0.3)
+        return ok(n=args["n"])
+
+    order = []
+
+    async def act(args):
+        order.append(args["n"])
+        await asyncio.sleep(0.05)
+        return ok()
+
+    async def yes(intent, tool, args):
+        return True
+
+    reg = ToolRegistry([Tool("peek", "r", {"type": "object", "properties": {}}, Risk.READ, slow_read),
+                        Tool("poke", "a", {"type": "object", "properties": {}}, Risk.ACT, act)])
+    llm = ScriptedLLM([call("peek", {"n": 1}, "a"), call("peek", {"n": 2}, "b"), call("peek", {"n": 3}, "c")],
+                      [TextDelta("Done.")])
+    agent = Agent(llm, reg, PermissionGate(yes, audit), audit)
+    t0 = time.perf_counter()
+    events = await collect(agent, "look")
+    assert time.perf_counter() - t0 < 0.75  # three 0.3 s reads together, not 0.9 s one after another
+    tool_msgs = [json.loads(m["content"])["n"] for m in agent.history if m["role"] == "tool"]
+    assert tool_msgs == [1, 2, 3] and [e.decision for e in events if isinstance(e, ToolFinished)] == ["auto"] * 3
+    assert [r["tool"] for r in audit.recent()].count("peek") == 3
+
+    # Interrupted mid-read: every call still gets a (failed) result in the history, so the next request is valid.
+    agent3 = Agent(ScriptedLLM([call("peek", {"n": 1}, "a"), call("peek", {"n": 2}, "b")]), reg, PermissionGate(yes, audit), audit)
+
+    async def go():
+        async for _ in agent3.run("look"):
+            pass
+
+    task = asyncio.create_task(go())
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    calls_made = [tc["id"] for m in agent3.history if m.get("tool_calls") for tc in m["tool_calls"]]
+    answered = [m["tool_call_id"] for m in agent3.history if m["role"] == "tool"]
+    assert calls_made == answered == ["a", "b"]
+
+    llm2 = ScriptedLLM([call("poke", {"n": 1}, "a"), call("poke", {"n": 2}, "b")], [TextDelta("ok")])
+    agent2 = Agent(llm2, reg, PermissionGate(yes, audit), audit)
+    await collect(agent2, "poke twice")
+    assert order == [1, 2]  # actions: one at a time, each through the gate
+
+
+async def test_a_declined_action_is_not_asked_again_in_the_same_turn(audit):
+    asked = []
+
+    async def deny(intent, tool, args):
+        asked.append(tool.name)
+        return False
+
+    # The model keeps re-requesting the refused action (measured with the 4B on a Hindi reminder).
+    llm = ScriptedLLM(*[[call("poke", {}, f"c{i}")] for i in range(6)])
+    agent, calls = make(audit, llm, confirm=deny)
+    events = []
+    async for ev in agent.run("याद दिलाना", "hi"):
+        events.append(ev)
+    assert asked == ["poke"] and calls == []  # asked once, never again
+    assert [e.decision for e in events if isinstance(e, ToolFinished)] == ["denied", "declined-earlier"]
+    assert "".join(e.text for e in events if isinstance(e, Say)) == "ठीक है, यह नहीं करेंगे।"  # in the reply language
 
 
 async def test_prewarm_sends_the_prompt_for_one_token_and_swallows_errors(audit):

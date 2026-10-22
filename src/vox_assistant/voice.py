@@ -23,8 +23,9 @@ from voxvortex.asr import is_hallucination
 from voxvortex.audio import FRAME_MS, pcm_duration_ms, SAMPLE_RATE
 from voxvortex.tts import SentenceSegmenter
 
+from . import language
 from .agent import Agent, Say, ToolFinished, ToolStarted
-from .disclosure import GUEST_NOTICE
+from .asr_gpu import join_readings, split_readings
 
 log = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ CHIME = _chime(CHIME_RATE)
 # end of the sentence: speech synthesis is not streamed within a chunk, so a long first sentence delayed the first
 # audio by ~7 s (measured). Later chunks are whole sentences, synthesized while earlier ones play.
 _CLAUSE_END = re.compile(r"^((?:\S+\s+){2,}?\S*?[,;:–—])\s")  # at least three words, then , ; : or a dash
-_SENTENCE_END = re.compile(r"^(.*?[.!?])\s")
+_SENTENCE_END = re.compile(r"^(.*?[.!?।॥])\s")  # incl. the Devanagari full stops । ॥
 
 
 class EagerSegmenter:
@@ -75,9 +76,21 @@ class EagerSegmenter:
             return text or None
         return self.inner.flush()
 
-YES = {"yes", "yeah", "yep", "sure", "okay", "ok", "go", "proceed", "confirm", "do"}
-NO = {"no", "nope", "don't", "dont", "cancel", "stop", "never", "negative", "nah"}
-_WORDS = re.compile(r"[a-z']+")
+YES = {"yes", "yeah", "yep", "sure", "okay", "ok", "go", "proceed", "confirm", "do",
+       # Hindi / Hinglish
+       "haan", "haa", "han", "ha", "ji", "jee", "theek", "thik", "karo", "kardo", "bilkul", "chalo",
+       "हाँ", "हां", "हा", "जी", "ठीक", "करो", "करिए", "कीजिए", "बिल्कुल", "चलो"}
+NO = {"no", "nope", "don't", "dont", "cancel", "stop", "never", "negative", "nah",
+      # Hindi / Hinglish: any of these anywhere wins, so "mat karo" / "मत करो" is a refusal despite "karo"
+      "nahi", "nahin", "nai", "na", "mat", "ruko", "rehne", "band",
+      "नहीं", "नही", "ना", "मत", "रुको", "रुकिए", "रहने", "बंद", "कैंसल"}
+# Latin letters and digits, and Devanagari including its vowel signs (which `\w` does not match) but not the danda
+# punctuation । ॥ (U+0964/0965).
+_WORDS = re.compile(r"[a-z0-9'ऀ-ॣ०-ॿ]+")
+
+
+# What Whisper tends to "hear" in a short noise when decoding as Hindi (cf. VoxVortex's English list).
+HINDI_HALLUCINATIONS = {"धन्यवाद", "शुक्रिया", "धन्यवाद धन्यवाद", "सब्सक्राइब करें", "dhanyavaad", "shukriya"}
 
 
 def parse_yes_no(text: str) -> bool | None:
@@ -113,14 +126,20 @@ class VoiceLoop:
         self.voice_mode = "cloned"  # or "neutral"
         # Guest mode: other people can hear. Neutral voice, and the next reply starts by saying this is an AI.
         self.guest = bool(getattr(settings, "guest_mode", False))
+        # Language: the mode (auto / en / hi / hinglish) and the language of the current reply (auto follows the user).
+        self.language_mode = getattr(settings, "language", "auto")
+        if self.language_mode not in language.MODES:
+            self.language_mode = "auto"
+        self.reply_lang = self.language_mode if self.language_mode != "auto" else "en"
         self._notice_due = self.guest
         self._last_warm_ms = -1e12
         self._spot_task: asyncio.Task | None = None
         self._spot_len_ms = 0.0
         self._chimed = False  # the current wake was already acknowledged with a chime
         self._spec: asyncio.Task | None = None  # speculative transcript of the utterance so far
-        self._acks: dict[int, list[tuple[bytes, int]]] = {}  # id(tts engine) -> pre-synthesized acknowledgements
+        self._acks: dict[tuple[int, str], list[tuple[bytes, int]]] = {}  # (id(tts engine), language) -> clips
         self._ack_next = 0
+        self._hearing = False  # inside an utterance right now
         self.mode = mode  # "wake": wait for the wake phrase; "always": every utterance is for the assistant
         self.end_silence_ms, self.min_speech_ms, self.barge_in_ms = end_silence_ms, min_speech_ms, barge_in_ms
         self.awake_seconds, self.confirm_timeout_s = awake_seconds, confirm_timeout_s
@@ -167,7 +186,9 @@ class VoiceLoop:
         """Windows lets an idle GPU go cold within ~30 s (first token / first audio then +1.5-2.6 s)."""
         while True:
             await asyncio.sleep(every_s)
-            if not self.muted and not self._busy_speaking() and self._turn_idle():
+            # Never while the user is mid-sentence: a keep-warm then holds the voice model (~0.4 s) just when their
+            # answer needs it. The wake and utterance-start pre-warms cover that case.
+            if not self.muted and not self._hearing and not self._busy_speaking() and self._turn_idle():
                 self._warm(force=True)
 
     def _turn_idle(self) -> bool:
@@ -261,6 +282,7 @@ class VoiceLoop:
                             self._spawn(self._on_utterance(pcm, early))
                         elif early is not None:
                             early.cancel()
+                self._hearing = in_utt
         finally:
             if reminder_task:
                 reminder_task.cancel()
@@ -288,11 +310,13 @@ class VoiceLoop:
             log.warning("ASR failed: %s", exc)
             self.emit("error", where="asr", message=str(exc))
             return
-        if not text or is_hallucination(text, pcm_duration_ms(pcm, SAMPLE_RATE)):
+        speech_ms = pcm_duration_ms(pcm, SAMPLE_RATE)
+        if not text or is_hallucination(text, speech_ms) or \
+                (speech_ms < 900 and " ".join(_WORDS.findall(text.lower())) in HINDI_HALLUCINATIONS):
             return
         self.emit("heard", text=text)
         if self._confirm_future is not None and not self._confirm_future.done():
-            self._confirm_future.set_result(text)
+            self._confirm_future.set_result(text)  # yes/no is read from both readings; "no" in either wins
             return
         chimed, self._chimed = self._chimed, False
         request = self._gate_by_wake(text)
@@ -300,10 +324,11 @@ class VoiceLoop:
             return
         if not request:
             if not chimed:  # the chime already said "I'm listening"
-                self._spawn(self._say_plain("Yes?"))
+                self._spawn(self._say_plain(self._phrase("wake_ack")))
             return
         if self._local_command(request):
             return
+        self.reply_lang = language.reply_language(self.language_mode, request)
         if self._turn and not self._turn.done():
             self._turn.cancel()
         self._turn = self._spawn(self._run_turn(request))
@@ -311,16 +336,31 @@ class VoiceLoop:
     def _wake_phrases(self) -> list[str]:
         return [self.settings.wake_phrase, *getattr(self.settings, "wake_aliases", [])]
 
+    def _phrase(self, key: str, **kw) -> str:
+        return language.phrase(self.reply_lang, key, **kw)
+
+    def _strip_wake(self, text: str) -> str | None:
+        """The request after the wake phrase, looked for in each reading of a two-reading (Hindi/English) transcript.
+        '' if only the wake phrase was said; None if no reading has it."""
+        readings = split_readings(text)
+        rests = [strip_wake_phrase(r, self._wake_phrases()) for r in readings]
+        found = [r for r in rests if r is not None]
+        if not found:
+            return None
+        if not any(found):  # the wake phrase alone
+            return ""
+        return join_readings([rest if rest is not None else reading for reading, rest in zip(readings, rests)])
+
     def _gate_by_wake(self, text: str) -> str | None:
         if self.muted:
-            rest = strip_wake_phrase(text, self._wake_phrases())
-            if rest is not None and re.search(r"\bunmute\b|\bwake up\b|\blisten\b", rest):
+            rest = self._strip_wake(text)
+            if rest is not None and re.search(r"\bunmute\b|\bwake up\b|\blisten\b|अनम्यूट|सुनो|\bsuno\b|वापस आओ|\bwapas aao\b", rest):
                 self.muted = False
                 self._awake_until = self.clock_ms + self.awake_seconds * 1000
                 self.emit("unmuted")
-                self._spawn(self._say_plain("I'm listening again."))
+                self._spawn(self._say_plain(self._phrase("unmuted")))
             return None
-        rest = strip_wake_phrase(text, self._wake_phrases())
+        rest = self._strip_wake(text)
         if rest is not None:
             self._awake_until = self.clock_ms + self.awake_seconds * 1000
             return rest
@@ -330,73 +370,101 @@ class VoiceLoop:
         return None
 
     def _local_command(self, text: str) -> bool:
-        """Privacy controls handled in code, so they work even when the LLM is down or mistaken."""
-        t = " ".join(_WORDS.findall(text.lower()))
-        if re.fullmatch(r"(please )?(mute|stop listening|go to sleep)( now)?", t):
+        """Privacy and language controls handled in code, so they work even when the LLM is down or mistaken. Each
+        reading of a two-reading transcript is tried."""
+        for reading in split_readings(text):
+            t = " ".join(_WORDS.findall(reading.lower()))
+            if self._local_command_one(t):
+                return True
+        return False
+
+    def _local_command_one(self, t: str) -> bool:
+        if re.fullmatch(r"(please )?(mute|stop listening|go to sleep)( now)?|(chup|चुप) (ho jao|हो जाओ|raho|रहो)|"
+                        r"(म्यूट|mute) (करो|karo|हो जाओ|ho jao)|(sunna|सुनना) (band karo|बंद करो)", t):
             self.muted = True
             self.emit("muted")
-            self._spawn(self._say_plain("Muted. Say the wake phrase and unmute when you want me back."))
+            self._spawn(self._say_plain(self._phrase("muted")))
             return True
         if re.fullmatch(r"(please )?(use|switch to) (a |the )?(neutral|default|generic) voice", t):
             self.voice_mode = "neutral"
             self.emit("voice_mode", mode="neutral")
-            self._spawn(self._say_plain("Using the neutral voice."))
+            self._spawn(self._say_plain(self._phrase("neutral_on")))
             return True
-        if re.fullmatch(r"(please )?(use|switch to) my voice", t):
+        if re.fullmatch(r"(please )?(use|switch to) my voice|(meri|मेरी) (awaaz|आवाज़|आवाज) (mein|में) (bolo|बोलो)", t):
             self.voice_mode = "cloned"
             self.emit("voice_mode", mode="cloned")
-            self._spawn(self._say_plain("Guest mode is on, so I'll keep the neutral voice until you turn it off."
-                                        if self.guest else "Using your cloned voice."))
+            self._spawn(self._say_plain(self._phrase("cloned_blocked" if self.guest else "cloned_on")))
             return True
-        if re.fullmatch(r"(please )?((turn off|disable|end|stop|exit) guest mode|guest mode off)( now)?|(i'?m|i am) alone( now)?", t):
+        if re.fullmatch(r"(please )?((turn off|disable|end|stop|exit) guest mode|guest mode off)( now)?|(i'?m|i am) alone( now)?|"
+                        r"(mehmaan|मेहमान) (chale gaye|चले गए)", t):
             self.guest = self._notice_due = False
             self.emit("guest_mode", on=False)
-            self._spawn(self._say_plain("Guest mode is off."))
+            self._spawn(self._say_plain(self._phrase("guest_off")))
             return True
-        if re.fullmatch(r"(please )?((turn on|enable|start) )?guest mode( on)?|(we|i) have (guests|visitors|company)( here)?", t):
+        if re.fullmatch(r"(please )?((turn on|enable|start) )?guest mode( on)?|(we|i) have (guests|visitors|company)( here)?|"
+                        r"(mehmaan|मेहमान) (aaye hain|आए हैं|आये हैं)", t):
             self.guest, self._notice_due = True, False
             self.emit("guest_mode", on=True)
-            self._spawn(self._say_plain(f"Guest mode is on. {GUEST_NOTICE}"))
+            self._spawn(self._say_plain(self._phrase("guest_on", notice=self._phrase("notice"))))
+            return True
+        mode = language.switch_command(t)
+        if mode is not None:
+            self.language_mode = mode
+            self.reply_lang = mode if mode != "auto" else self.reply_lang
+            self.emit("language", mode=mode)
+            self._spawn(self._prepare_acks())
+            self._spawn(self._say_plain(self._phrase("switched_auto" if mode == "auto" else "switched")))
             return True
         return False
 
     # -- speaking -------------------------------------------------------------------------
     async def _prepare_acks(self) -> None:
-        """Synthesize the acknowledgement phrases once per voice, so they can play the instant a tool starts."""
+        """Synthesize the acknowledgement phrases once per voice and language, so they play the instant a tool starts.
+        Hindi/Hinglish ones only when the mode can answer in them, and only for engines that can speak Hindi."""
+        langs = ["en"] if self.language_mode == "en" else ["en", "hi", "hinglish"]
         for engine in (self.cloned_tts, self.neutral_tts):
-            if engine is None or id(engine) in self._acks:
+            if engine is None:
                 continue
-            clips = []
-            for phrase in self.settings.ack_phrases:
-                try:
-                    pcm = b"".join([c async for c in engine.synth(phrase)])
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    log.debug("could not prepare %r: %s", phrase, exc)
-                    break
-                clips.append((pcm, engine.sample_rate))
-            if clips:
-                self._acks[id(engine)] = clips
+            for lang in langs:
+                if (id(engine), lang) in self._acks or (lang != "en" and not getattr(engine, "speaks_hindi", False)):
+                    continue
+                phrases = self.settings.ack_phrases if lang == "en" else language.ACKS[lang]
+                if not phrases:
+                    continue
+                clips = []
+                for phrase in phrases:
+                    try:
+                        pcm = b"".join([c async for c in engine.synth(phrase)])
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        log.debug("could not prepare %r: %s", phrase, exc)
+                        break
+                    clips.append((pcm, engine.sample_rate))
+                if clips:
+                    self._acks[(id(engine), lang)] = clips
 
     def _ack(self) -> tuple[bytes, int] | None:
-        clips = self._acks.get(id(self.tts))
+        clips = self._acks.get((id(self.tts), self.reply_lang))
         if not clips:
             return None  # never synthesize one live: that would delay the answer instead of covering for it
         self._ack_next = (self._ack_next + 1) % len(clips)
         return clips[self._ack_next]
 
     async def _say_plain(self, text: str) -> None:
-        await self._speak_sentences(_one(text))
+        await self._speak(text, trim_start=True)
 
-    async def _speak_sentences(self, sentences: AsyncIterator[str]) -> None:
-        async for sentence in sentences:
-            await self._speak(sentence)
-
-    async def _speak(self, sentence: str) -> None:
+    async def _speak(self, sentence: str, trim_start: bool = False) -> None:
+        """`trim_start`: drop the near-silence the engine puts before the voice (VoxCPM2: 0.29-0.46 s measured). Only
+        for the first sentence of something said; between sentences that silence is the natural pause."""
         for engine in ([self.tts] if self.tts is self.neutral_tts else [self.tts, self.neutral_tts]):
             try:
+                trim = LeadTrim(engine.sample_rate) if trim_start else None
                 async for chunk in engine.synth(sentence):
+                    if trim is not None:
+                        chunk = trim(chunk)
+                        if not chunk:
+                            continue
                     self.speaker.play(chunk, engine.sample_rate)
                 if engine is self.neutral_tts and self.tts is not self.neutral_tts and not self._warned_fallback:
                     self._warned_fallback = True
@@ -414,18 +482,20 @@ class VoiceLoop:
         said_something = False
 
         async def talker():
+            first = True
             while (s := await queue.get()) is not None:
                 if isinstance(s, tuple):  # a pre-synthesized acknowledgement
                     self.speaker.play(*s)
                 else:
-                    await self._speak(s)
+                    await self._speak(s, trim_start=first)
+                    first = False
 
         talk = asyncio.ensure_future(talker())
         if self._notice_due:  # guest mode was on from the start: disclose before the first reply
             self._notice_due = False
-            queue.put_nowait(GUEST_NOTICE)
+            queue.put_nowait(self._phrase("notice"))
         try:
-            async for ev in self.agent.run(request):
+            async for ev in self.agent.run(request, self.reply_lang):
                 if isinstance(ev, Say):
                     said_something = True
                     self.emit("say", text=ev.text)
@@ -454,13 +524,13 @@ class VoiceLoop:
             log.exception("turn failed")
             self.emit("error", where="turn", message=str(exc))
             talk.cancel()
-            await self._say_plain("Sorry, something went wrong on my side.")
+            await self._say_plain(self._phrase("error"))
 
     # -- confirmation by voice ------------------------------------------------------------
     async def _confirm(self, intent: str, tool, args: dict) -> bool:
         for attempt in range(2):
             self.emit("confirm_request", intent=intent)
-            await self._say_plain(f"I'm about to {intent}. Say yes to go ahead, or no to cancel.")
+            await self._say_plain(self._phrase("confirm", intent=intent))
             await self.speaker.drain()
             self._confirm_future = asyncio.get_running_loop().create_future()
             try:
@@ -474,21 +544,44 @@ class VoiceLoop:
             if verdict is not None:
                 self.emit("confirm_result", approved=verdict)
                 return verdict
-            await self._say_plain("Sorry, I only need a yes or a no.")
+            await self._say_plain(self._phrase("unclear"))
             await self.speaker.drain()
         self.emit("confirm_result", approved=False, reason="unclear")
         return False
 
     # -- reminders ------------------------------------------------------------------------
     async def _reminder_loop(self) -> None:
+        # Claimed, then marked fired only once spoken: a crash in between makes the reminder due again.
+        claim = getattr(self.reminders, "claim_due", self.reminders.due)
         while True:
             await asyncio.sleep(2.0)
-            for r in self.reminders.due():
+            for r in claim():
                 self.emit("reminder", text=r["text"])
                 while self._busy_speaking():
                     await asyncio.sleep(0.5)
-                await self._say_plain(f"Reminder: {r['text']}")
+                await self._say_plain(self._phrase("reminder", text=r["text"]))
+                if hasattr(self.reminders, "mark_fired"):
+                    self.reminders.mark_fired(r["id"])
 
 
-async def _one(text: str):
-    yield text
+class LeadTrim:
+    """Drops leading near-silence from PCM16 arriving in pieces, keeping `keep_s` before the first sound."""
+
+    def __init__(self, rate: int, peak: int = 330, keep_s: float = 0.03, max_s: float = 1.0) -> None:
+        self.rate, self.peak, self.keep, self.budget = rate, peak, int(keep_s * rate), int(max_s * rate)
+        self.done = False
+        self.held = np.zeros(0, dtype=np.int16)  # the last `keep` samples of silence, played before the first sound
+
+    def __call__(self, pcm: bytes) -> bytes:
+        if self.done:
+            return pcm
+        x = np.frombuffer(pcm, dtype=np.int16)
+        loud = np.flatnonzero(np.abs(x.astype(np.int32)) > self.peak)
+        if len(loud) or self.budget <= len(x):
+            self.done = True
+            start = int(loud[0]) if len(loud) else 0
+            lead = np.concatenate([self.held, x[:start]])[-self.keep:] if self.keep else np.zeros(0, np.int16)
+            return np.concatenate([lead, x[start:]]).astype("<i2").tobytes()
+        self.budget -= len(x)
+        self.held = np.concatenate([self.held, x])[-self.keep:]
+        return b""
