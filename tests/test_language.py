@@ -100,7 +100,7 @@ def test_service_picks_the_hindi_reference_for_devanagari_text(settings):
     from vox_assistant.tts_service import create_app
 
     backend = FakeBackend()
-    c = TestClient(create_app(settings, backend_factory=lambda: backend))
+    c = TestClient(create_app(settings, backend_factory=lambda: backend), base_url="http://127.0.0.1")
     profiles = VoiceProfiles(settings.voices_dir)
     profiles.create("me", tone(), 16000, "hello there", permission_confirmed=True)
     profiles.create("me-hi", tone(seed=1), 16000, "नमस्ते", permission_confirmed=True, language="hi")
@@ -117,7 +117,7 @@ def test_asr_endpoint_and_client_fallback(settings):
         def readings(self, audio, languages, prompts=None):
             return {"hi": "नोटपैड खोलो", "en": "Notepad Kholo"}
 
-    c = TestClient(create_app(settings, backend_factory=lambda: None, asr_factory=FakeAsr))
+    c = TestClient(create_app(settings, backend_factory=lambda: None, asr_factory=FakeAsr), base_url="http://127.0.0.1")
     pcm = (np.zeros(16000, np.int16)).tobytes()
     d = c.post("/asr", json={"pcm_b64": base64.b64encode(pcm).decode()}).json()
     assert d["used"] == "both" and d["readings"]["en"] == "Notepad Kholo" and "नोटपैड खोलो" in d["text"]

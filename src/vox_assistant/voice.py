@@ -15,6 +15,7 @@ import asyncio
 import logging
 import re
 from collections import deque
+from datetime import datetime
 from typing import AsyncIterator, Awaitable, Callable
 
 import numpy as np
@@ -26,11 +27,15 @@ from voxvortex.tts import SentenceSegmenter
 from . import language
 from .agent import Agent, Say, ToolFinished, ToolStarted
 from .asr_gpu import join_readings, split_readings
+from .tools.reminders import is_late
 
 log = logging.getLogger(__name__)
 
 WARM_EVERY_MS = 15000  # at most one pre-warm per 15 s
 SPECULATE_AFTER_MS = 200  # start transcribing at this much silence; used if the utterance then ends (450 ms)
+# Steady noise (a fan, music) can keep the VAD above threshold so the pause never comes; the voice service takes at
+# most 60 s per request. 30 s is also where the panel's microphone button stops.
+MAX_UTTERANCE_MS = 30000
 SPOT_FROM_MS, SPOT_UNTIL_MS, SPOT_STEP_MS = 600, 3000, 250  # the wake phrase is at the start of an utterance
 
 
@@ -76,6 +81,8 @@ class EagerSegmenter:
             return text or None
         return self.inner.flush()
 
+# An answer counts as yes only when it starts with one of these (after a filler word): "yes please", "do it",
+# "haan kar do". Anywhere else they are too common: "what do you mean" is a question, not consent.
 YES = {"yes", "yeah", "yep", "sure", "okay", "ok", "go", "proceed", "confirm", "do",
        # Hindi / Hinglish
        "haan", "haa", "han", "ha", "ji", "jee", "theek", "thik", "karo", "kardo", "bilkul", "chalo",
@@ -84,6 +91,12 @@ NO = {"no", "nope", "don't", "dont", "cancel", "stop", "never", "negative", "nah
       # Hindi / Hinglish: any of these anywhere wins, so "mat karo" / "मत करो" is a refusal despite "karo"
       "nahi", "nahin", "nai", "na", "mat", "ruko", "rehne", "band",
       "नहीं", "नही", "ना", "मत", "रुको", "रुकिए", "रहने", "बंद", "कैंसल"}
+FILLERS = {"uh", "um", "umm", "hmm", "oh", "well", "so", "please", "acha", "achha", "अच्छा"}
+# A question or a hesitation is not an answer: ask again rather than read consent into it.
+NOT_AN_ANSWER = {"what", "which", "why", "how", "who", "when", "where", "wait", "maybe",
+                 "kya", "kaun", "kaunsa", "kyun", "kyon", "kaise", "kahan", "shayad",
+                 "क्या", "कौन", "कौनसा", "क्यों", "कैसे", "कहाँ", "कहां", "शायद"}
+MAX_ANSWER_WORDS = 8
 # Latin letters and digits, and Devanagari including its vowel signs (which `\w` does not match) but not the danda
 # punctuation । ॥ (U+0964/0965).
 _WORDS = re.compile(r"[a-z0-9'ऀ-ॣ०-ॿ]+")
@@ -93,13 +106,25 @@ _WORDS = re.compile(r"[a-z0-9'ऀ-ॣ०-ॿ]+")
 HINDI_HALLUCINATIONS = {"धन्यवाद", "शुक्रिया", "धन्यवाद धन्यवाद", "सब्सक्राइब करें", "dhanyavaad", "shukriya"}
 
 
-def parse_yes_no(text: str) -> bool | None:
-    words = _WORDS.findall(text.lower())
+def _yes_no_one(reading: str) -> bool | None:
+    words = _WORDS.findall(reading.lower())
     if not words:
         return None
     if any(w in NO for w in words):  # "no, don't" must never read as consent
         return False
-    return True if any(w in YES for w in words) else None
+    if "?" in reading or len(words) > MAX_ANSWER_WORDS or any(w in NOT_AN_ANSWER for w in words):
+        return None
+    while words and words[0] in FILLERS:
+        words.pop(0)
+    return True if words and words[0] in YES else None
+
+
+def parse_yes_no(text: str) -> bool | None:
+    """Each reading of a two-reading (Hindi/English) transcript is judged: "no" in either wins, then "yes" in either."""
+    verdicts = [_yes_no_one(r) for r in split_readings(text)]
+    if False in verdicts:
+        return False
+    return True if True in verdicts else None
 
 
 def strip_wake_phrase(text: str, phrase: str | list[str]) -> str | None:
@@ -149,6 +174,7 @@ class VoiceLoop:
         self._awake_until = -1.0
         self._turn: asyncio.Task | None = None
         self._confirm_future: asyncio.Future | None = None
+        self._asking: asyncio.Task | None = None  # the yes/no question being spoken
         self._tasks: set[asyncio.Task] = set()
         agent.gate.confirm = self._confirm
         self._warned_fallback = False
@@ -247,7 +273,11 @@ class VoiceLoop:
                 self.clock_ms += FRAME_MS
                 p = self.vad.prob(frame)
                 busy = self._busy_speaking()
-                hot = p > (0.7 if busy else 0.5)
+                # Starting speech should remain sensitive. Once an utterance has started,
+                # use a slightly stronger threshold: Silero often scores fans, speakers and
+                # steady room noise around 0.5-0.6, which previously meant a natural pause
+                # was never considered silence and the request stayed open indefinitely.
+                hot = p > (0.7 if busy else (0.60 if in_utt else 0.5))
                 if not in_utt:
                     pre.append(frame)
                     voiced = voiced + 1 if hot else 0
@@ -272,7 +302,7 @@ class VoiceLoop:
                     elif silence >= SPECULATE_AFTER_MS and self._spec is None \
                             and pcm_duration_ms(b"".join(utter), SAMPLE_RATE) - silence >= self.min_speech_ms:
                         self._spec = self._spawn(self._transcribe(b"".join(utter)))
-                    if silence >= self.end_silence_ms:
+                    if silence >= self.end_silence_ms or len(utter) * FRAME_MS >= MAX_UTTERANCE_MS:
                         pcm = b"".join(utter)
                         in_utt, utter, voiced, speaking_ms = False, [], 0, 0.0
                         pre.clear()
@@ -292,6 +322,12 @@ class VoiceLoop:
 
     def interrupt(self) -> None:
         self.speaker.stop()
+        if self._asking is not None and not self._asking.done():
+            # Speaking over the yes/no question answers it: stop asking and listen. The turn waits for that answer;
+            # cancelling it here would drop the action the user is about to approve.
+            self._asking.cancel()
+            self.emit("interrupted", during="confirm")
+            return
         if self._turn and not self._turn.done():
             self._turn.cancel()
         self.emit("interrupted")
@@ -321,11 +357,13 @@ class VoiceLoop:
         chimed, self._chimed = self._chimed, False
         request = self._gate_by_wake(text)
         if request is None:
+            self.emit("ignored", reason="wake_phrase_missing")
             return
         if not request:
             if not chimed:  # the chime already said "I'm listening"
                 self._spawn(self._say_plain(self._phrase("wake_ack")))
             return
+        self.emit("request", text=request)
         if self._local_command(request):
             return
         self.reply_lang = language.reply_language(self.language_mode, request)
@@ -528,26 +566,33 @@ class VoiceLoop:
 
     # -- confirmation by voice ------------------------------------------------------------
     async def _confirm(self, intent: str, tool, args: dict) -> bool:
+        question = self._phrase("confirm", intent=intent)
         for attempt in range(2):
             self.emit("confirm_request", intent=intent)
-            await self._say_plain(self._phrase("confirm", intent=intent))
-            await self.speaker.drain()
-            self._confirm_future = asyncio.get_running_loop().create_future()
+            # Listen from the first word of the question: people often answer before it ends. Their speech then stops
+            # the question (interrupt) instead of cancelling the turn, and is read as the answer.
+            fut = self._confirm_future = asyncio.get_running_loop().create_future()
+            self._asking = asyncio.ensure_future(self._ask([question] if attempt == 0 else [self._phrase("unclear"), question]))
             try:
-                answer = await asyncio.wait_for(self._confirm_future, self.confirm_timeout_s)
+                await asyncio.wait({self._asking, fut}, return_when=asyncio.FIRST_COMPLETED)
+                answer = await asyncio.wait_for(fut, self.confirm_timeout_s)
             except asyncio.TimeoutError:
                 self.emit("confirm_result", approved=False, reason="timeout")
                 return False
             finally:
-                self._confirm_future = None
+                self._asking.cancel()
+                self._asking = self._confirm_future = None
             verdict = parse_yes_no(answer)
             if verdict is not None:
                 self.emit("confirm_result", approved=verdict)
                 return verdict
-            await self._say_plain(self._phrase("unclear"))
-            await self.speaker.drain()
         self.emit("confirm_result", approved=False, reason="unclear")
         return False
+
+    async def _ask(self, sentences: list[str]) -> None:
+        for s in sentences:
+            await self._say_plain(s)
+        await self.speaker.drain()
 
     # -- reminders ------------------------------------------------------------------------
     async def _reminder_loop(self) -> None:
@@ -559,7 +604,11 @@ class VoiceLoop:
                 self.emit("reminder", text=r["text"])
                 while self._busy_speaking():
                     await asyncio.sleep(0.5)
-                await self._say_plain(self._phrase("reminder", text=r["text"]))
+                if is_late(r):  # nothing was running at its time: say when it was for
+                    await self._say_plain(self._phrase("reminder_late", text=r["text"],
+                                                       time=datetime.fromtimestamp(r["due"]).strftime("%H:%M")))
+                else:
+                    await self._say_plain(self._phrase("reminder", text=r["text"]))
                 if hasattr(self.reminders, "mark_fired"):
                     self.reminders.mark_fired(r["id"])
 

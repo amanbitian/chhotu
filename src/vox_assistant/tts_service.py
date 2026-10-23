@@ -425,14 +425,15 @@ def create_app(settings: Settings | None = None, backend_factory: Callable[[], A
         if preset_name not in PRESETS:
             raise HTTPException(400, f"preset must be one of {sorted(PRESETS)}")
         preset = PRESETS[preset_name]
-        try:
-            profile = state.resolve(body.voice, text)
-        except VoiceError as exc:
-            raise HTTPException(409, str(exc))
-        # Each sentence as the model should read it: Hindi numbers as Hindi words, Hinglish ones in English, English as is.
+        # Each sentence as the model should read it: Hindi numbers as Hindi words, Hinglish ones in English, English as is,
+        # romanized Hindi in Devanagari.
         chunks = [speech_text.normalize(c) for c in split_for_tts(text)]
         if not chunks:
             raise HTTPException(400, "input has nothing to speak")
+        try:  # after normalizing: romanized Hinglish is now Devanagari, so it gets the Hindi reference if there is one
+            profile = state.resolve(body.voice, " ".join(chunks))
+        except VoiceError as exc:
+            raise HTTPException(409, str(exc))
 
         def synth_chunk(index: int, chunk: str) -> tuple[np.ndarray, dict]:
             with state.lock:

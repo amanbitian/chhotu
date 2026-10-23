@@ -35,6 +35,8 @@ class Tool:
     handler: Handler
     describe: Callable[[dict], str] | None = None  # plain-language "what I am about to do", spoken before asking
     timeout_s: float | None = None  # None: the agent's default (loading a model on a GPU needs longer)
+    # True for these arguments: this call is as risky as a destructive one, so it is always asked, even if pre-approved.
+    escalate: Callable[[dict], bool] | None = None
 
     def spec(self) -> dict:
         return {"type": "function", "function": {"name": self.name, "description": self.description,
@@ -57,7 +59,7 @@ class PermissionGate:
         """Returns (allowed, decision label). The agent records the decision and the result in the audit log."""
         if tool.risk is Risk.READ:
             decision = "auto"
-        elif tool.risk is Risk.ACT and tool.name in self.auto_approve:
+        elif tool.risk is Risk.ACT and tool.name in self.auto_approve and not (tool.escalate and tool.escalate(args)):
             decision = "pre-approved"
         elif self.confirm is None:
             decision = "denied-no-confirmer"

@@ -13,6 +13,7 @@ from vox_assistant.voice import VoiceLoop, parse_yes_no, strip_wake_phrase
 
 VOICED = b"\xff" * 1024
 QUIET = b"\x00" * 1024
+ROOM_NOISE = bytes([140]) * 1024  # VAD probability 0.55: old endpoint logic treated this as speech forever
 
 
 class FakeVAD:
@@ -173,9 +174,18 @@ async def test_wake_phrase_alone_just_acknowledges(settings, tmp_path):
 
 async def test_always_mode_needs_no_wake_phrase(settings, tmp_path):
     llm = ScriptedLLM([TextDelta("Hi.")])
-    loop, _, _ = build(settings, tmp_path, asr=FakeASR("hello there"), llm=llm, mode="always")
+    loop, events, _ = build(settings, tmp_path, asr=FakeASR("hello there"), llm=llm, mode="always")
     await loop.run(feed(utterance()))
     assert llm.users == ["hello there"]
+    assert [e["text"] for e in events if e["kind"] == "request"] == ["hello there"]
+
+
+async def test_a_gap_ends_the_turn_even_when_room_noise_has_a_borderline_vad_score(settings, tmp_path):
+    llm = ScriptedLLM([TextDelta("I heard you.")])
+    loop, events, _ = build(settings, tmp_path, asr=FakeASR("hello there"), llm=llm, mode="always")
+    await loop.run(feed([VOICED] * 12 + [ROOM_NOISE] * 22))
+    assert llm.users == ["hello there"]
+    assert "say" in kinds(events)
 
 
 async def test_short_noise_is_discarded(settings, tmp_path):
@@ -469,3 +479,91 @@ async def test_due_reminders_are_spoken(settings, tmp_path):
 
     await loop.run(slow())
     assert tts.spoken == ["Reminder: check the print"] and "reminder" in kinds(events)
+
+
+def test_yes_no_needs_a_short_answer_that_starts_with_yes():
+    from vox_assistant.asr_gpu import join_readings
+
+    for consent in ("yes please", "okay, do it", "go ahead", "um, sure", "haan kar do", "theek hai"):
+        assert parse_yes_no(consent) is True, consent
+    for unclear in ("what do you mean", "which one do you want to open", "I think so",
+                    "wait", "yes?", "okay wait", "हाँ, क्या?", "go and tell me everything you know about this thing first"):
+        assert parse_yes_no(unclear) is None, unclear
+    assert parse_yes_no(join_readings(["हाँ", "Haan."])) is True
+    assert parse_yes_no(join_readings(["क्या मतलब", "What do you mean?"])) is None  # the reading separator is not words
+
+
+class TalkingSpeaker(FakeSpeaker):
+    """Audio stays queued until it is stopped or has played for a second, like a real device."""
+
+    async def drain(self):
+        for _ in range(100):
+            if not self.pending_seconds:
+                return
+            await asyncio.sleep(0.01)
+        self.pending_seconds = 0.0
+
+    def play(self, pcm, rate):
+        super().play(pcm, rate)
+        self.pending_seconds = 1.0
+
+    def stop(self):
+        super().stop()
+        self.pending_seconds = 0.0
+
+
+async def test_answering_before_the_question_ends_approves_instead_of_cancelling(settings, tmp_path):
+    llm = ScriptedLLM([ToolCall("c1", "poke", {}, "{}")], [TextDelta("Done.")])
+    loop, events, ran = build(settings, tmp_path, asr=FakeASR("hey vox poke it", "yes please"), llm=llm)
+    loop.speaker = TalkingSpeaker()
+    # the second utterance starts while the question is still playing, long enough to count as barge-in
+    await loop.run(feed(utterance() + [QUIET] * 30 + utterance(n_voiced=20)))
+    assert {"kind": "interrupted", "during": "confirm"} in events
+    assert [e["approved"] for e in events if e["kind"] == "confirm_result"] == [True]
+    assert ran == [{}]
+
+
+async def test_a_reminder_spoken_late_says_when_it_was_due(settings, tmp_path):
+    import time
+    from datetime import datetime
+
+    due = time.time() - 3600
+
+    class Store:
+        def __init__(self):
+            self.items = [{"id": 1, "text": "call mum", "due": due}]
+
+        def due(self):
+            out, self.items = self.items, []
+            return out
+
+    tts = FakeTTS()
+    loop, _, _ = build(settings, tmp_path, asr=FakeASR(), llm=ScriptedLLM(), tts=tts)
+    loop.reminders = Store()
+
+    async def slow():
+        for _ in range(60):
+            yield QUIET
+            await asyncio.sleep(0.05)
+
+    await loop.run(slow())
+    assert tts.spoken == [f"A reminder that was due at {datetime.fromtimestamp(due):%H:%M}: call mum"]
+
+
+async def test_an_utterance_that_never_pauses_is_cut_at_the_limit_and_still_transcribed(settings, tmp_path, monkeypatch):
+    # A fan or music can hold the VAD above threshold forever; the voice service refuses over 60 s (HTTP 400).
+    from vox_assistant import voice
+
+    monkeypatch.setattr(voice, "MAX_UTTERANCE_MS", 20 * 32)
+    heard = []
+
+    class Recording(FakeASR):
+        async def transcribe(self, pcm, *, language="auto", prompt=None):
+            heard.append(len(pcm))
+            return await super().transcribe(pcm, language=language, prompt=prompt)
+
+    llm = ScriptedLLM([TextDelta("Got it.")])
+    loop, _, _ = build(settings, tmp_path, asr=Recording("hello there"), llm=llm, mode="always")
+    await loop.run(feed([VOICED] * 30))  # never a pause
+    assert heard and max(heard) <= 20 * 1024 + 10 * 1024  # the cap plus the frames kept from before speech started
+    assert llm.users == ["hello there"]

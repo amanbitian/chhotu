@@ -1,8 +1,15 @@
-"""Local reminders. The store is SQLite; whichever runtime is active (voice loop or web app) polls `due()` and speaks them."""
+"""Local reminders. The store is SQLite, shared by the control panel and hands-free mode (separate processes).
+
+Exactly one of them delivers each reminder: hands-free mode speaks them while it runs; otherwise the panel announces
+them to the page and as a Windows notification. Taking a reminder is one transaction, so two processes polling at the
+same moment never both get it.
+"""
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import subprocess
 import threading
 import time
 from datetime import datetime
@@ -11,11 +18,42 @@ from pathlib import Path
 from ..config import Settings
 from ..permissions import Risk, Tool, fail, ok
 
+LATE_AFTER_S = 120.0  # a reminder delivered this long after its time says when it was due (nothing was running)
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+# Title and text travel in environment variables, never in the script text.
+_TOAST = r"""
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+$x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+$t = $x.GetElementsByTagName('text')
+$t.Item(0).AppendChild($x.CreateTextNode($env:VOXA_TITLE)) > $null
+$t.Item(1).AppendChild($x.CreateTextNode($env:VOXA_TEXT)) > $null
+$app = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show([Windows.UI.Notifications.ToastNotification]::new($x))
+"""
+
+
+def show_toast(title: str, text: str) -> bool:
+    """A Windows notification; False if it could not be shown (not Windows, or PowerShell failed)."""
+    if os.name != "nt":
+        return False
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", _TOAST], capture_output=True,
+                           env={**os.environ, "VOXA_TITLE": title, "VOXA_TEXT": text}, timeout=20, creationflags=NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+def is_late(reminder: dict, now: float | None = None) -> bool:
+    return bool(reminder.get("due")) and (now or time.time()) - reminder["due"] > LATE_AFTER_S
+
 
 class ReminderStore:
     def __init__(self, path: Path, clock=time.time) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(str(path), check_same_thread=False)
+        # Autocommit, with an explicit transaction where one is needed (_take); wait out the other process's write.
+        self._db = sqlite3.connect(str(path), check_same_thread=False, timeout=10.0, isolation_level=None)
         self._lock = threading.Lock()
         self._clock = clock
         with self._lock:
@@ -60,10 +98,16 @@ class ReminderStore:
     def _take(self, state: str) -> list[dict]:
         now = self._clock()
         with self._lock:
-            rows = self._db.execute(self._DUE, (now, now - self.CLAIM_TIMEOUT_S)).fetchall()
-            self._db.executemany("UPDATE reminders SET state=?, claimed_at=? WHERE id=?", [(state, now, r[0]) for r in rows])
-            self._db.commit()
-        return [{"id": i, "due": d, "text": t} for i, d, t in rows]
+            self._db.execute("BEGIN IMMEDIATE")  # the write lock first: the other process waits, then sees them taken
+            try:
+                rows = self._db.execute(self._DUE, (now, now - self.CLAIM_TIMEOUT_S)).fetchall()
+                self._db.executemany("UPDATE reminders SET state=?, claimed_at=? WHERE id=?",
+                                     [(state, now, r[0]) for r in rows])
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+        return [{"id": i, "due": d, "text": t, "due_local": datetime.fromtimestamp(d).strftime("%H:%M")} for i, d, t in rows]
 
     def close(self) -> None:
         with self._lock:

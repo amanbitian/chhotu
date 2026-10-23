@@ -1,8 +1,10 @@
 """Projects: open one in VS Code ("switch to the Cutline project") and hand a coding task to a coding agent.
 
 A project is a folder directly inside one of `search_roots`. The coding agent is a configured command
-(`coding_agent`, OpenCode by default) started in a new, visible terminal, so the user can watch and stop it. What it
-may do without asking is the agent's own permission setting, not ours.
+(`coding_agent`, OpenCode by default). With a task manager (the control panel, and hands-free mode started by it) the
+job is tracked in the Tasks panel with its output and a stop button; without one it starts in a new, visible terminal,
+so the user can watch and stop it. Letting a tracked agent change files without asking is said in the approval
+question and is never pre-approved.
 """
 
 from __future__ import annotations
@@ -13,12 +15,17 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import psutil
 
 from ..config import Settings
 from ..permissions import Risk, Tool, fail, ok
+from .apps import vscode_exe
 from .files import SKIP_DIRS
+
+if TYPE_CHECKING:
+    from ..tasks import TaskManager
 
 # cmd.exe (and ';' for Windows Terminal) would treat these as syntax inside the task text; they become spaces.
 _CMD_UNSAFE = re.compile(r'["&|<>^%!;\r\n]')
@@ -52,6 +59,19 @@ def match_project(name: str, projects: list[Path]) -> Path | list[Path] | None:
     return loose or None
 
 
+def allows_changes(args: dict) -> bool:
+    """The model's `allow_changes`, read strictly: only a real true (or "true") counts; bool("false") would be True."""
+    value = args.get("allow_changes", False)
+    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
+
+
+def describe_task(args: dict, tracked: bool = True) -> str:
+    text = f"start the coding agent in {args.get('project')} with the task: {str(args.get('task', ''))[:120]}"
+    # Said in the approval question: approving this lets the agent change files without asking you first. (Untracked,
+    # the agent runs in a visible terminal and asks there itself.)
+    return text + (", and let it change files without asking you" if tracked and allows_changes(args) else "")
+
+
 def cmd_task(task: str) -> str:
     return " ".join(_CMD_UNSAFE.sub(" ", task).split())
 
@@ -76,7 +96,7 @@ def launch_line(template: list[str], folder: Path, exe: str) -> str:
     return f'cmd /c start "" /D "{folder}" cmd /v:on /k "' + " ".join(arg(p) for p in parts) + '"'
 
 
-def make_tools(settings: Settings) -> list[Tool]:
+def make_tools(settings: Settings, task_manager: TaskManager | None = None) -> list[Tool]:
     def resolve(args: dict) -> tuple[Path | None, dict | None]:
         found = match_project(str(args.get("project", "")), list_projects(settings))
         if found is None:
@@ -93,13 +113,11 @@ def make_tools(settings: Settings) -> list[Tool]:
         folder, err = resolve(args)
         if err:
             return err
-        code = settings.apps.get("vs code", "code")
-        exe = shutil.which(code)
+        exe = vscode_exe(settings)
         if not exe:
             return fail("VS Code's `code` command is not on PATH.")
         before = {p.pid for p in psutil.process_iter(["name"]) if (p.info["name"] or "").lower() == "code.exe"}
-        subprocess.Popen([exe, str(folder)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         creationflags=subprocess.CREATE_NO_WINDOW, shell=exe.lower().endswith(".cmd"))
+        subprocess.Popen([exe, str(folder)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(20):  # VS Code reuses its main process, so look for its window title instead of a new process
             await asyncio.sleep(0.25)
             from .windows import list_windows
@@ -118,6 +136,14 @@ def make_tools(settings: Settings) -> list[Tool]:
         task = str(args.get("task", "")).strip()
         if not task:
             return fail("What should the coding agent do?")
+        if task_manager is not None:
+            try:
+                job = task_manager.start(folder, task, allow_changes=allows_changes(args))
+            except (RuntimeError, ValueError) as exc:
+                return fail(str(exc))
+            return ok(project=folder.name, agent=settings.coding_agent[0], task_id=job["id"],
+                      status=job["status"],
+                      note="The task is visible in the Tasks panel, including its live output and stop control.")
         cmd = agent_command(settings.coding_agent, task)
         exe = shutil.which(cmd[0])
         if not exe:
@@ -138,13 +164,17 @@ def make_tools(settings: Settings) -> list[Tool]:
                   note="The terminal was opened but I could not see the agent process yet.")
 
     project_arg = {"project": {"type": "string", "description": "project folder name, loosely matched"}}
+    tracked = task_manager is not None
     return [
         Tool("list_projects", "List the project folders I can open.", {"type": "object", "properties": {}}, Risk.READ, projects),
         Tool("open_project", "Open (switch to) a project folder in VS Code.",
              {"type": "object", "properties": project_arg, "required": ["project"]}, Risk.ACT, open_project,
              describe=lambda a: f"open the {a.get('project')} project in VS Code"),
-        Tool("delegate_coding_task", "Hand a coding task to the local coding agent, in a new terminal in the project folder.",
-             {"type": "object", "properties": {**project_arg, "task": {"type": "string"}}, "required": ["project", "task"]},
-             Risk.ACT, delegate_coding_task,
-             describe=lambda a: f"start the coding agent in {a.get('project')} with the task: {str(a.get('task', ''))[:120]}"),
+        Tool("delegate_coding_task", "Hand a coding task to the local coding agent and track it in the Tasks panel."
+             if tracked else "Hand a coding task to the local coding agent, in a new terminal window in the project folder.",
+             {"type": "object", "properties": {**project_arg, "task": {"type": "string"},
+              "allow_changes": {"type": "boolean", "description": "Auto-approve the coding agent only when the user explicitly asks it to make changes."}},
+              "required": ["project", "task"]},
+             Risk.ACT, delegate_coding_task, describe=lambda a: describe_task(a, tracked),
+             escalate=allows_changes if tracked else None),
     ]

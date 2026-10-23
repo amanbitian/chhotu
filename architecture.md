@@ -126,14 +126,17 @@ src/vox_assistant/
   tools/             system, models, files, knowledge, apps, projects, windows, screen, clipboard, reminders, workflows
   voice.py           VoiceLoop: VAD turn-taking, wake spotting, hotkey wake, speculative ASR, pre-warm and keep-warm,
                      acknowledgements, eager first clause, barge-in, spoken confirm, mute / neutral / guest mode, reminders
-  webapp.py          FastAPI app: speak, chat (NDJSON), confirm, voices, audit, reminders
+  webapp.py          FastAPI app: speak, chat (NDJSON), confirm, voices, services, tracked tasks, audit, reminders
+  services.py        starts/stops the LLM, voice service and hands-free loop; captures status and logs
+  tasks.py           runs coding-agent jobs in project folders; captures status, elapsed time, output and cancellation
   security.py        loopback-only request guard shared by webapp and tts_service
   cli.py             vox devices|enroll|voices [list|use|revoke|check]|say|ask|serve|listen|llm-server|doctor
-web/index.html       single-page UI (no build step)
+main.py              launcher for the control panel and managed services
+web/index.html       single-page control panel (no build step)
 scripts/             start.ps1 start_all.ps1 start_llm.ps1 start_tts.ps1
                      smoke_test.py (real components) agent_eval.py (model accuracy and speed)
                      clone_check.py (enroll -> clone -> score -> revoke) desktop_check.py (live desktop tools)
-tests/               157 tests (see sdd.md section 8)
+tests/               174 tests (see sdd.md section 8)
 scripts/language_eval.py   spoken English / Hindi / Hinglish -> recognised -> wake phrase -> understood
 ```
 
@@ -224,11 +227,12 @@ Handlers return `ok(**data)` or `fail(error, **data)` and report *measured* outc
 | `read_clipboard` | read | PowerShell `Get-Clipboard` | 6000 chars returned |
 | `set_clipboard` | act | value via env var, read back | – |
 | `open_app` | act | `cmd /c start`, then the process must appear | `apps` allowlist only |
-| `open_path` | act | `os.startfile` | inside roots; executables and scripts refused |
-| `open_url`, `web_search` | act | default browser (`web_search_url`) | http/https only; result cannot be read back |
+| `open_path` | act | `os.startfile` for folders, documents, pictures and media; any other file in VS Code (`Code.exe` started directly, no shell) | inside roots; nothing else reaches its default application (`.sh`, `.chm`, `.pif`… would run) |
+| `open_url`, `web_search` | act | default browser (`web_search_url`) | http/https only; the approval shows the whole address, not only the site; search returns untrusted result titles/snippets |
+| `read_search_result` | read | latest approved search result | public http/https targets only; local/private addresses rejected |
 | `list_projects` | read | folders directly in `search_roots` | – |
 | `open_project` | act | `code <folder>`, then a VS Code window titled with the folder must appear | project folders only |
-| `delegate_coding_task` | act | new console in the project folder runs `coding_agent` (OpenCode); its process must appear | task text sanitised and passed by environment variable |
+| `delegate_coding_task` | act (always asked when `allow_changes`) | panel and hands-free mode started by it: a tracked job in the Tasks panel (`opencode run`, `--auto` only if approved); `vox listen` alone: new console in the project folder | one task per project; stopped after `coding_task_timeout_min`; history in `tasks.json`; the approval says when changes are auto-approved |
 | `list_windows` | read | Win32 EnumWindows (visible, uncloaked, titled) | titles are untrusted |
 | `window_action` | act | focus / minimize / maximize / restore, then window state is read back | – |
 | `close_window` | **destructive** | WM_CLOSE, then the window must be gone; never forced | – |
@@ -242,8 +246,9 @@ Handlers return `ok(**data)` or `fail(error, **data)` and report *measured* outc
 | Risk | Decision |
 | --- | --- |
 | READ | run |
-| ACT | ask, unless the tool name is in `auto_approve` (none by default) |
+| ACT | ask, unless the tool name is in the `auto_approve` setting (none by default) and the call is not escalated (a coding task allowed to change files) |
 | DESTRUCTIVE | always ask; `auto_approve` is ignored |
+| interrupted while asking | every call of that reply gets an "interrupted, not done" result and an audit row |
 | any, with no confirmer wired | refuse (`denied-no-confirmer`) |
 
 The voice confirmer speaks "I'm about to *intent*. Say yes to go ahead, or no to cancel." and waits for the next utterance (15 s, one re-ask, **"no" anywhere wins**); the web app emits `confirm_request` and waits for the button (90 s). The intent comes from the tool's `describe()`, not the model. For a workflow the intent lists every step. The decision is about the request, never about who is speaking.
@@ -347,7 +352,7 @@ Then, in order: Audio Clone's `configure_runtime` (caches, ROCm target family; a
 | `/api/reset` | POST | clear conversation |
 | `/api/voices` | GET / POST | list / add from a base64 WAV (+ transcript + consent) |
 | `/api/voices/{id}/activate` · `/revoke` | POST | switch / delete |
-| `/api/reminders/due` | GET | page polls every 5 s |
+| `/api/reminders/announced` | GET | read-only; the page polls every 5 s and speaks new ones. The panel itself takes due reminders every 3 s (and shows a Windows notification) unless hands-free mode runs and speaks them |
 | `/api/audit` | GET | latest audit rows |
 
 The page is dependency-free HTML/JS with light/dark themes. Checked in headless Edge at 1400 px and inside a 375 px frame: no horizontal scroll (the narrow layout uses `minmax(0,1fr)`, because a plain `1fr` grid column cannot shrink below its widest content). All dynamic text is escaped.
@@ -533,10 +538,10 @@ The reply language goes into the user message's time stamp ("[09:05, reply in Hi
 
 VoxCPM2 speaks Hindi. Measured: a voice cloned from an **English** recording, speaking Hindi, scored 0.972 against its own speaker (0.441 against another): the identity carries over. A Hindi reference (`vox enroll --language hi`, eight Hindi script lines with retroflex and aspirated sounds) can be added under the same person; the service then uses it for Devanagari text automatically and the English one otherwise.
 
-`speech_text.normalize()` prepares each sentence: English is left as written (VoxCPM2 reads digits and names itself, and VoxVortex's normalizer made "R9700" into "Rnine thousand seven hundred"); Hindi numbers become Hindi words (52 → बावन, 64.6 → चौंसठ दशमलव छह, % → प्रतिशत; heard back as "52" instead of "पास्ट दू"); Hinglish numbers become English words. Digits inside names are never touched.
+`speech_text.normalize()` prepares each sentence: English is left as written (VoxCPM2 reads digits and names itself, and VoxVortex's normalizer made "R9700" into "Rnine thousand seven hundred"); Hindi numbers become Hindi words (52 → बावन, 64.6 → चौंसठ दशमलव छह, % → प्रतिशत; heard back as "52" instead of "पास्ट दू"); Hinglish numbers become English words. Digits inside names are never touched. Clock times are said the Hindi way (19:30 → शाम साढ़े सात बजे; the part of the day only when a 24-hour time makes it certain). Hindi words the LLM wrote in English letters ("aapke dono GPU ka … hai") are converted to Devanagari before speaking, from a list of common Hindi words that are not also English words, plus do / to / hi straight after a Hindi word: measured by transcribing the voice back, Hindi words heard rose from 55% to 80% on romanized replies.
 
 The assistant's own sentences (wake acknowledgement, confirmation question, mute, guest notice, reminders, "let me check") exist in all three languages (`language.PHRASES`), avoiding gendered first-person verbs. Windows has no Hindi voice installed here, so the **neutral** voice speaks Hindi through the voice service with a synthetic, non-cloned reference (`neutral_voice_profile`), or a Windows Hindi voice if one is installed (`neutral_hindi_voice`).
 
 ### 19.4 Permissions are unchanged
 
-Hindi and Hinglish yes/no words, "no" anywhere wins (also across both readings), silence is a refusal, and a refused action is never asked for again in the same turn (the 4B had re-requested a refused Hindi reminder six times).
+Hindi and Hinglish yes/no words, "no" anywhere wins (also across both readings), a yes must start a short answer that is not a question ("what do you mean" is not consent), silence is a refusal, and a refused action is never asked for again in the same turn (the 4B had re-requested a refused Hindi reminder six times). The answer is listened for from the first word of the question: speaking over it stops the question and is read as the answer, instead of cancelling the turn.

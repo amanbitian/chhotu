@@ -13,6 +13,8 @@ import httpx
 
 log = logging.getLogger(__name__)
 
+MAX_PCM_BYTES = 16000 * 2 * 60  # the voice service takes at most 60 s of 16 kHz PCM16
+
 
 class ServiceASR:
     def __init__(self, base_url: str, fallback=None, timeout: float = 20.0) -> None:
@@ -24,13 +26,16 @@ class ServiceASR:
 
     async def transcribe(self, pcm: bytes, *, language: str = "auto", prompt: str | None = None) -> str:
         try:
-            r = await self._client.post("/asr", json={"pcm_b64": base64.b64encode(pcm).decode()})
+            r = await self._client.post("/asr", json={"pcm_b64": base64.b64encode(pcm[:MAX_PCM_BYTES]).decode()})
             r.raise_for_status()
             d = r.json()
         except (httpx.HTTPError, ValueError) as exc:
             if self.fallback is None:
                 raise
-            log.warning("GPU speech recognition unavailable (%s); using the CPU recogniser", exc)
+            reason = f"{exc.response.status_code}: {exc.response.text[:200]}" if isinstance(exc, httpx.HTTPStatusError) \
+                else f"{type(exc).__name__}: {exc}"
+            log.warning("GPU speech recognition unavailable (%s, %.1f s of audio); using the CPU recogniser", reason,
+                        len(pcm) / 32000)
             self.last_backend = "cpu"
             text = await self.fallback.transcribe(pcm, language=language, prompt=prompt)
             self.last_readings, self.last_language = {"cpu": text}, getattr(self.fallback, "last_language", None)

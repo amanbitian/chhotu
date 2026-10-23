@@ -63,7 +63,7 @@ def test_enrollment_script_is_long_enough_for_a_reference():
 
 # -- request guard on the TTS service -----------------------------------------------------------
 def test_tts_service_rejects_foreign_hosts_origins_and_form_posts(settings):
-    c = TestClient(create_tts(settings, backend_factory=lambda: None))
+    c = TestClient(create_tts(settings, backend_factory=lambda: None), base_url="http://127.0.0.1")
     assert c.get("/health").status_code == 200
     assert c.get("/health", headers={"host": "evil.example"}).status_code == 403
     assert c.post("/unload", json={}, headers={"origin": "https://evil.example"}).status_code == 403
@@ -72,25 +72,51 @@ def test_tts_service_rejects_foreign_hosts_origins_and_form_posts(settings):
 
 
 # -- tools / web --------------------------------------------------------------------------------
-async def test_open_path_refuses_programs_even_inside_the_allowed_roots(settings, tmp_path):
+async def test_open_path_never_hands_a_program_to_its_default_application(settings, tmp_path, monkeypatch):
+    from vox_assistant.tools import apps
+
     root = tmp_path / "proj"
     root.mkdir()
-    for name in ("run.bat", "tool.exe", "x.ps1", "shortcut.lnk", "m.py"):
+    programs = ("run.bat", "tool.exe", "x.ps1", "shortcut.lnk", "m.py", "build.sh", "help.chm", "a&calc.txt.pif")
+    for name in (*programs, "notes.pdf"):
         (root / name).write_text("echo hi")
     settings.search_roots = [str(root)]
+    started, launched = [], []
+    monkeypatch.setattr(apps.os, "startfile", lambda p: started.append(p), raising=False)
+    monkeypatch.setattr(apps.subprocess, "Popen", lambda cmd, **kw: launched.append(cmd))
+    monkeypatch.setattr(apps, "vscode_exe", lambda s: r"C:\VSCode\Code.exe")
     reg, _ = build_registry(settings)
-    for name in ("run.bat", "tool.exe", "x.ps1", "shortcut.lnk", "m.py"):
+    for name in programs:
         r = await reg.get("open_path").handler({"path": str(root / name)})
-        assert r["ok"] is False and "run a program" in r["error"]
+        assert r["ok"] and r["opened_in"] == "VS Code", name
+        assert launched[-1] == [r"C:\VSCode\Code.exe", str(root / name)]  # an argument list: no shell parses the name
+        assert reg.get("open_path").intent({"path": str(root / name)}).endswith("in VS Code")
+    assert started == []  # nothing was run
+    assert (await reg.get("open_path").handler({"path": str(root / "notes.pdf")}))["ok"] and started == [str(root / "notes.pdf")]
+    monkeypatch.setattr(apps, "vscode_exe", lambda s: None)
+    assert not (await reg.get("open_path").handler({"path": str(root / "build.sh")}))["ok"]
 
 
-async def test_due_reminders_are_delivered_once_over_http(settings):
+async def test_the_panel_announces_due_reminders_once_unless_hands_free_speaks_them(settings, monkeypatch):
+    from vox_assistant import webapp
+
+    toasts = []
+    monkeypatch.setattr(webapp, "show_toast", lambda title, text: toasts.append((title, text)))
     app = create_web(settings, llm=object())
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8765") as c:
         app.state.reminders.add("stretch", 0.0001)
         time.sleep(0.05)
-        assert [r["text"] for r in (await c.get("/api/reminders/due")).json()["due"]] == ["stretch"]
-        assert (await c.get("/api/reminders/due")).json()["due"] == []
+        assert [r["text"] for r in app.state.announce_due()] == ["stretch"]
+        assert app.state.announce_due() == []  # delivered once
+        assert toasts == [("Vox reminder", "stretch")]  # also a Windows notification, for when the page is closed
+        first = (await c.get("/api/reminders/announced")).json()  # a page that just opened gets the recent ones
+        assert [r["text"] for r in first["reminders"]] == ["stretch"] and first["reminders"][0]["late"] is False
+        assert (await c.get(f"/api/reminders/announced?after={first['seq']}")).json()["reminders"] == []  # read-only
+
+        app.state.services.services["listen"].alive = lambda: True  # hands-free runs: it speaks them, not the panel
+        app.state.reminders.add("drink water", 0.0001)
+        time.sleep(0.05)
+        assert app.state.announce_due() == [] and len(app.state.reminders.pending()) == 1
 
 
 # -- wake phrase --------------------------------------------------------------------------------

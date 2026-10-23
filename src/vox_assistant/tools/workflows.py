@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 
+from ..audit import AuditLog
 from ..config import Settings
 from ..permissions import Risk, Tool, ToolRegistry, fail, ok
 
@@ -34,7 +35,7 @@ def validate(workflows: dict, registry: ToolRegistry) -> list[str]:
     return problems
 
 
-def make_tools(settings: Settings, registry: ToolRegistry) -> list[Tool]:
+def make_tools(settings: Settings, registry: ToolRegistry, audit: AuditLog | None = None) -> list[Tool]:
     workflows = settings.workflows
     if not workflows:
         return []
@@ -62,6 +63,9 @@ def make_tools(settings: Settings, registry: ToolRegistry) -> list[Tool]:
             except Exception as exc:  # one broken step is reported, the rest still run
                 r = fail(f"{type(exc).__name__}: {exc}")
             results.append({"step": tool.name, **r})
+            if audit is not None:  # each step in the log, not only the workflow: what ran is what was approved
+                audit.record("tool", tool.name, tool.risk.value, step_args, f"workflow {name}", bool(r.get("ok")),
+                             r.get("error") or ("ok" if r.get("ok") else "not ok"))
         return ok(workflow=name, steps=results, all_ok=all(r.get("ok") for r in results))
 
     listing = "; ".join(f"{n} ({(wf or {}).get('description', '')})" for n, wf in workflows.items())

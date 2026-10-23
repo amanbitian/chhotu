@@ -35,7 +35,7 @@ class FakeBackend:
 def client(settings):
     backend = FakeBackend()
     app = create_app(settings, backend_factory=lambda: backend)
-    c = TestClient(app)
+    c = TestClient(app, base_url="http://127.0.0.1")
     c.backend = backend
     c.profiles = VoiceProfiles(settings.voices_dir)
     return c
@@ -151,7 +151,7 @@ class StreamingBackend(FakeBackend):
 
 def test_pcm_is_streamed_piece_by_piece_and_wav_stays_whole(settings):
     backend = StreamingBackend()
-    c = TestClient(create_app(settings, backend_factory=lambda: backend))
+    c = TestClient(create_app(settings, backend_factory=lambda: backend), base_url="http://127.0.0.1")
     VoiceProfiles(settings.voices_dir).create("me", tone(), 16000, "hello there", permission_confirmed=True)
     with c.stream("POST", "/audio/speech", json={"input": "One. Two."}) as r:
         pieces = [p for p in r.iter_bytes() if p]
@@ -161,7 +161,7 @@ def test_pcm_is_streamed_piece_by_piece_and_wav_stays_whole(settings):
     w = c.post("/audio/speech", json={"input": "One.", "response_format": "wav"})
     assert w.status_code == 200 and backend.generated[-1] == "One."  # whole-sentence path (FakeBackend.generate)
     settings.tts_stream = False
-    c2 = TestClient(create_app(settings, backend_factory=lambda: backend))
+    c2 = TestClient(create_app(settings, backend_factory=lambda: backend), base_url="http://127.0.0.1")
     assert c2.post("/audio/speech", json={"input": "One."}).status_code == 200  # the old whole-sentence pcm path
 
 
@@ -177,7 +177,7 @@ def test_a_failing_model_is_an_http_error_not_an_empty_stream(settings):
 
             self.model = Model()
 
-    c = TestClient(create_app(settings, backend_factory=Broken))
+    c = TestClient(create_app(settings, backend_factory=Broken), base_url="http://127.0.0.1")
     VoiceProfiles(settings.voices_dir).create("me", tone(), 16000, "hello there", permission_confirmed=True)
     r = c.post("/audio/speech", json={"input": "Hello."})
     assert r.status_code == 500 and "GPU fell over" in r.json()["detail"]

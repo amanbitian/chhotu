@@ -15,6 +15,7 @@ from vox_assistant.llm_server import build_command
 from vox_assistant.permissions import Risk, Tool, ToolRegistry, ok
 from vox_assistant.tools import build_registry
 from vox_assistant.tools import models as models_mod
+from vox_assistant.tools.apps import _is_public_web_url, parse_search_results, summarize_page
 from vox_assistant.tools.knowledge import search_text
 from vox_assistant.tools.models import match_lane, match_model
 from vox_assistant.tools.projects import agent_command, launch_line, match_project
@@ -29,6 +30,16 @@ def test_hotkey_parsing():
     for bad in ("", "j", "ctrl+", "hyper+j", "ctrl+alt+spacebar"):
         with pytest.raises(ValueError):
             parse(bad)
+
+
+def test_web_results_and_prices_are_extracted_without_inventing_values():
+    search = '''<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.amazon.in%2Fdp%2FABC">Sony headphones</a>
+                <a class="result__snippet">Amazon listing for the Sony model.</a>'''
+    assert parse_search_results(search) == [{"title": "Sony headphones", "url": "https://www.amazon.in/dp/ABC",
+                                              "snippet": "Amazon listing for the Sony model."}]
+    page = summarize_page("<title>Sony</title><p>Deal price ₹35,989.00</p><script>₹1</script>")
+    assert page["title"] == "Sony" and page["currency_amounts"] == ["₹35,989.00"]
+    assert not _is_public_web_url("http://127.0.0.1:8765/api/status")
 
 
 def test_window_matching():
@@ -145,6 +156,7 @@ def test_default_registry_has_every_feature_and_valid_workflows(settings):
     try:
         for name in ("gpu_status", "list_models", "available_models", "load_model", "unload_model", "system_info",
                      "find_files", "read_text_file", "search_notes", "open_app", "open_path", "open_url", "web_search",
+                     "read_search_result",
                      "list_projects", "open_project", "delegate_coding_task", "list_windows", "window_action",
                      "close_window", "look_at_screen", "read_clipboard", "set_clipboard", "set_reminder",
                      "list_reminders", "cancel_reminder", "run_workflow"):
@@ -192,3 +204,25 @@ def test_config_parses_booleans_and_optional_paths_from_env(tmp_path, monkeypatc
     assert s.guest_mode is False and s.llm_mmproj is None
     monkeypatch.setenv("VOXA_GUEST_MODE", "1")
     assert Settings.load(tmp_path).guest_mode is True
+
+
+async def test_coding_task_approval_names_auto_approved_changes(settings, tmp_path):
+    from vox_assistant.tools.projects import make_tools as project_tools
+
+    (tmp_path / "proj" / "Cutline").mkdir(parents=True)
+    settings.search_roots = [str(tmp_path / "proj")]
+    started = []
+
+    class Tasks:
+        def start(self, folder, task, *, allow_changes):
+            started.append(allow_changes)
+            return {"id": "t1", "status": "running"}
+
+    tool = {t.name: t for t in project_tools(settings, Tasks())}["delegate_coding_task"]
+    plain = {"project": "cutline", "task": "fix the tests"}
+    assert "without asking" not in tool.intent(plain)
+    assert "change files without asking you" in tool.intent({**plain, "allow_changes": True})
+    for value, expect in ((True, True), ("true", True), ("false", False), ("no", False), (1, False), (None, False)):
+        assert (await tool.handler({**plain, "allow_changes": value}))["ok"]
+        assert started[-1] is expect, value
+        assert ("without asking" in tool.intent({**plain, "allow_changes": value})) is expect

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tomllib
 from dataclasses import dataclass, field, fields
@@ -21,6 +22,8 @@ class Settings:
     llm_gguf: Path = Path("G:/LLM models/lmstudio-community/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf")
     llm_mmproj: Path | None = Path("G:/LLM models/lmstudio-community/Qwen3.5-4B-GGUF/mmproj-Qwen3.5-4B-BF16.gguf")  # vision: look_at_screen
     llm_gpu: str = "ROCm0"  # llama.cpp device name; ROCm0 is the R9700
+    # The same GPU as Dual GPU names it (a fragment, like tts_device): loading a lane model there is said to share it.
+    llm_gpu_label: str = "r9700"
     llm_ctx: int = 32768
     dual_gpu_url: str = "http://127.0.0.1:8090"
     # TTS: tts_service.py, run inside the Audio Clone virtualenv (it owns the ROCm PyTorch + VoxCPM2 install).
@@ -32,7 +35,8 @@ class Settings:
     tts_hip_runtime: str = "driver"
     # MIOpen (AMD's convolution library) crashes on streaming decode's tiny shapes here; PyTorch's own convs are as fast.
     tts_miopen: bool = False
-    tts_stream: bool = True  # pcm responses stream ~0.16 s pieces as generated (False: whole sentences)    # Language: "auto" (reply in the language you speak), "en", "hi" (Hindi, Devanagari) or "hinglish". Any language is
+    tts_stream: bool = True  # pcm responses stream ~0.16 s pieces as generated (False: whole sentences)
+    # Language: "auto" (reply in the language you speak), "en", "hi" (Hindi, Devanagari) or "hinglish". Any language is
     # understood in every mode; this sets how the assistant answers. Switch by voice ("Hindi mein baat karo").
     language: str = "auto"
     # ASR: Whisper large-v3-turbo on the GPU in the voice service, decoding Hindi and English together ("service");
@@ -77,6 +81,9 @@ class Settings:
     # While listening, touch the LLM and the voice model this often (seconds; 0 = only when woken). Measured: after
     # >= 30 s idle the GPUs go cold and the first token / first audio cost 1.5-2.6 s more; within 10 s they do not.
     keep_warm_s: int = 15
+    # End a hands-free request after this much trailing quiet. Speech detection uses a
+    # stricter threshold while inside an utterance so steady room noise cannot hold it open.
+    end_silence_ms: int = 700
     # Said (pre-synthesized, so instantly) when a read-only tool starts before any words: the answer itself needs the
     # tool result first. [] disables.
     ack_phrases: list[str] = field(default_factory=lambda: ["Let me check.", "One moment.", "Checking."])
@@ -91,9 +98,15 @@ class Settings:
         "vs code": "code", "firefox": "firefox", "chrome": "chrome", "notepad": "notepad",
         "calculator": "calc", "file explorer": "explorer", "terminal": "wt", "task manager": "taskmgr",
     })
-    # delegate_coding_task runs this in a new terminal in the project folder; {task} is replaced by the request.
-    # OpenCode's interactive UI in a visible window (not --auto, which approves everything without asking).
+    # delegate_coding_task's agent; {task} is replaced by the request. From the control panel (and hands-free mode started
+    # by it) the job runs headless with its output in the Tasks panel; OpenCode then runs as `opencode run`, with --auto
+    # only when the user approved letting it change files. `vox listen` on its own opens a visible terminal instead.
     coding_agent: list[str] = field(default_factory=lambda: ["opencode", "--prompt", "{task}"])
+    coding_task_timeout_min: int = 60  # a tracked coding task still running after this long is stopped; 0 = never
+    # ACT tools that run without asking, e.g. ["open_app", "set_reminder"]. Destructive tools always ask.
+    auto_approve: list[str] = field(default_factory=list)
+    # Due reminders also show as a Windows notification when hands-free mode is not running to speak them.
+    reminder_toast: bool = True
     web_search_url: str = "https://duckduckgo.com/?q={query}"
     # Named sequences of tool calls, e.g. [workflows.start_work] steps = [{tool = "open_app", args = {name = "vs code"}}]
     workflows: dict[str, dict] = field(default_factory=lambda: {
@@ -137,4 +150,8 @@ class Settings:
                 value = int(value)
             elif isinstance(current, list) and isinstance(value, str):
                 value = [v for v in value.split(";") if v]
+            elif isinstance(current, dict) and isinstance(value, str):  # VOXA_APPS='{"notepad": "notepad"}'
+                value = json.loads(value)
+            elif current is None and isinstance(value, str) and "int" in str(known[key].type) and value.strip().isdigit():
+                value = int(value)  # a device index, not a name fragment
             setattr(self, key, value)

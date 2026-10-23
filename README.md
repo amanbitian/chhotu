@@ -19,7 +19,7 @@ It is a thin layer over projects that already exist here, not a second speech st
 
 ## Status
 
-Everything works end to end on this machine in English, Hindi and Hinglish, **including the cloned voice**, which streams (fixed: see [what was wrong](#what-was-wrong-with-the-cloned-voice)). 157 automated tests pass; the real-component smoke test reports **40 PASS, 0 FAIL, 1 WARN**; the clone check **13/13**; the live desktop check **17/17**; the agent eval **68/68** with no false claims and no reply in the wrong language.
+Everything works end to end on this machine in English, Hindi and Hinglish, **including the cloned voice**, which streams (fixed: see [what was wrong](#what-was-wrong-with-the-cloned-voice)). 174 automated tests pass; the real-component smoke test reports **40 PASS, 0 FAIL, 1 WARN**; the clone check **13/13**; the live desktop check **17/17**; the agent eval **68/68** with no false claims and no reply in the wrong language.
 
 What only you can do: **enroll your own voice** (`vox enroll`, and optionally `vox enroll --language hi`) and try `vox listen` with a headset, in Hindi too. Until you enroll, the active voice is `demo_v1`, Audio Clone's synthetic demo voice. All Hindi measurements so far used synthetic speakers with English accents; your own Hindi is the real test.
 
@@ -27,6 +27,8 @@ What only you can do: **enroll your own voice** (`vox enroll`, and optionally `v
 
 ```powershell
 cd F:\Projects\VoxVortex_pc_assistant
+.\VoxVortex.bat                    # easiest: launch the control panel and its services
+.\.venv\Scripts\python.exe main.py --listen  # same, plus hands-free listening
 .\scripts\start_all.ps1            # voice LLM + voice service in their own windows, then the web app (http://127.0.0.1:8765)
 .\scripts\start_all.ps1 listen     # same, then hands-free mode
 .\.venv\Scripts\vox.exe doctor     # what is reachable, and environment problems
@@ -35,7 +37,11 @@ cd F:\Projects\VoxVortex_pc_assistant
 1. **Enroll your voice** (microphone, quiet room, headset): `vox enroll`. Read 4–8 prompted lines; each take is checked for clipping, noise and length; the good ones become a 20–36 s reference with an exact transcript. Result: `me_v1` (enrolling again makes `me_v2`; `vox voices use me_v1` reverts). Optional: `vox enroll --language hi` records `me-hi_v1` from eight Hindi lines; it is then used for Hindi speech, your English one for the rest. Not required: a clone from an English recording already speaks Hindi as the same person (measured 0.972 similarity).
 2. **Score it**: `vox voices check me_v1` clones a test sentence and compares it with your recording (speaker-verification score; 0.86 or more = same speaker). Then listen: `vox say "Testing my cloned voice."` and `vox say "आज मौसम बहुत अच्छा है।"`.
 3. **Talk to it**: `vox listen`, then say "hey vox, …" in any of the three languages (a chime means it heard you, often before you finish), or press **Ctrl+Alt+J** and just talk. `--always` skips the wake phrase; `--language hi` starts in Hindi.
-4. **Type to it**: the web app (with a language selector), or `vox ask "..."` / `vox ask --language hinglish "..."`.
+4. **Type to it or assign work**: the control panel has Assistant chat plus a Tasks panel where you choose a project,
+   assign a coding task, watch live output and elapsed time, and stop it if needed. Or use `vox ask "..."` /
+   `vox ask --language hinglish "..."`.
+
+In the control panel, **reply after every utterance** makes hands-free mode answer after about 0.7 seconds of quiet without requiring “hey vox”. Changing that option while the listener is running restarts it automatically. Accepted hands-free requests, tool progress and replies are mirrored into the Assistant conversation; the raw service log remains available for speech-recognition diagnostics.
 
 ## English, Hindi, Hinglish
 
@@ -68,9 +74,10 @@ How it hears both languages: every utterance is transcribed on the GPU twice, as
 | `window_action` | act | Focus, minimize, maximize, restore; checked afterwards |
 | `close_window` | **destructive** | Like clicking ×; never forced |
 | `open_app`, `open_path` | act | Allowlisted apps; files/folders but never programs or scripts |
-| `open_url`, `web_search` | act | Opens your browser |
+| `open_url`, `web_search` | act | Opens your browser; search also returns readable titles/snippets to the agent |
+| `read_search_result` | read | Reads one result chosen from the latest search; exact current values are reported only when present |
 | `list_projects`, `open_project` | read / act | "Switch to the Cutline project" opens it in VS Code |
-| `delegate_coding_task` | act | Starts OpenCode in a new terminal in that project, with your request |
+| `delegate_coding_task` | act | Starts a tracked OpenCode job in that project; status and output appear in the Tasks panel |
 | `read_clipboard`, `set_clipboard` | read / act | Written values are read back |
 | `set_reminder`, `cancel_reminder`, `list_reminders` | act / read | Spoken when due |
 | `run_workflow` | act | Your named sequences from `config.toml`; one approval that names every step (default: `status_check`) |
@@ -118,6 +125,10 @@ keep_warm_s = 15                  # 0: let the GPUs idle down (the first reply a
 search_roots = ["F:/Projects"]
 knowledge_roots = ["F:/Projects"]
 coding_agent = ["opencode", "--prompt", "{task}"]
+coding_task_timeout_min = 60      # a tracked coding task still running after this long is stopped; 0 = never
+auto_approve = []                 # act tools that run without asking, e.g. ["open_app"]; destructive ones always ask
+reminder_toast = true             # Windows notification for due reminders when hands-free mode is not running
+llm_gpu_label = "r9700"           # the assistant's own LLM GPU as Dual GPU names it (load_model warns about sharing it)
 
 [workflows.start_work]
 description = "VS Code and the Dual GPU dashboard"
@@ -130,7 +141,7 @@ The voice LLM: `llm_gguf`, `llm_mmproj`, `llm_gpu` (`ROCm0` = R9700), `llm_base_
 
 | Command | What it proves |
 | --- | --- |
-| `.venv\Scripts\python.exe -m pytest` | 157 unit tests, no hardware needed |
+| `.venv\Scripts\python.exe -m pytest` | 174 unit tests, no hardware needed |
 | `.venv\Scripts\python.exe scripts\smoke_test.py` | Real LLM, telemetry, mic and speaker, VAD, GPU Whisper (and the CPU fallback), the voice loop in real time in the cloned voice (latency timelines), a spoken Hindi request answered in Hindi, switching language by voice, permission by voice, mute, web app incl. streamed page speech, clone round trip. Silent: a Windows voice (and, for Hindi, the voice service) plays the person and speaker output is captured. `--quick` for the voice-loop parts only |
 | `scripts\clone_check.py` | Enroll (synthetic speaker through the real recording path) → clone → intelligibility → similarity in English and in Hindi → revoke |
 | `scripts\language_eval.py` | Spoken English / Hindi / Hinglish requests → recognised → wake phrase → understood by the agent |
@@ -165,12 +176,12 @@ Not the iGPU. The ROCm PyTorch wheel in Audio Clone bundles HIP runtime 10.0.358
 ```
 src/vox_assistant/  config voices enroll tts_service voice_similarity disclosure tts_client tts_neutral speech_text
                     asr_gpu asr_remote asr_local language audio_io hotkey llm_client llm_server permissions audit agent
-                    voice webapp security cli
+                    voice webapp security services tasks cli
                     tools/{system,models,files,knowledge,apps,projects,windows,screen,clipboard,reminders,workflows}
-web/index.html      local web UI
+main.py / VoxVortex.bat  one-click launcher       web/index.html  local control panel
 scripts/            start.ps1 start_all.ps1 start_llm.ps1 start_tts.ps1
                     smoke_test.py clone_check.py desktop_check.py agent_eval.py language_eval.py
-tests/              157 tests, no hardware      data/   (git-ignored) voices, audit log, reminders, config.toml
+tests/              174 tests, no hardware      data/   (git-ignored) voices, audit log, reminders, config.toml
 architecture.md  sdd.md
 ```
 

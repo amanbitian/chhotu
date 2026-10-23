@@ -41,6 +41,25 @@
   table { width:100%; border-collapse:collapse; font-size:13px; } td, th { text-align:left; padding:4px 6px; border-top:1px solid var(--line); vertical-align:top; overflow-wrap:anywhere; }
   th { color:var(--mute); font-weight:600; border-top:0; } .wide { grid-column: 1 / -1; }
   details summary { cursor:pointer; color:var(--mute); }
+  .svc { display:flex; gap:10px; align-items:center; padding:8px 0; border-top:1px solid var(--line); flex-wrap:wrap; }
+  .svc:first-of-type { border-top:0; } .svc .grow { flex:1 1 220px; min-width:0; }
+  pre.logbox { margin:0 0 6px; max-height:200px; overflow:auto; font:12px/1.4 ui-monospace, Consolas, monospace; background:var(--bg);
+    border:1px solid var(--line); border-radius:8px; padding:8px; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .line { display:flex; gap:10px; align-items:center; padding:7px 0; border-top:1px solid var(--line); flex-wrap:wrap; }
+  .line:first-of-type { border-top:0; } .line .grow { flex:1 1 240px; min-width:0; }
+  .line.done .grow { color:var(--ok); } .line.now { background:color-mix(in srgb, var(--accent) 8%, transparent); border-radius:8px; }
+  .meter { height:6px; width:100%; background:var(--bg); border-radius:4px; overflow:hidden; border:1px solid var(--line); }
+  .meter > i { display:block; height:100%; width:0; background:var(--ok); transition:width .08s; }
+  .task { padding:11px 0; border-top:1px solid var(--line); }
+  .task:first-child { border-top:0; }
+  .task-head { display:flex; align-items:flex-start; gap:10px; flex-wrap:wrap; }
+  .task-head .grow { flex:1 1 260px; min-width:0; }
+  .task-prompt { margin-top:3px; overflow-wrap:anywhere; }
+  .task.running .task-progress { height:3px; margin-top:9px; border-radius:4px; overflow:hidden; background:var(--bg); }
+  .task.running .task-progress::after { content:""; display:block; width:38%; height:100%; background:var(--accent); animation:taskmove 1.3s ease-in-out infinite; }
+  @keyframes taskmove { from { transform:translateX(-110%); } to { transform:translateX(300%); } }
+  button.rec { background:var(--bad); color:#fff; border-color:var(--bad); } button.mic { padding:9px 12px; }
+  [hidden] { display:none !important; }
 </style>
 </head>
 <body>
@@ -49,6 +68,19 @@
   <div class="pills" id="pills"><span class="pill">checking…</span></div>
 </header>
 <main>
+  <section class="wide">
+    <h2>Services</h2>
+    <div id="services" class="meta">Checking…</div>
+    <div class="row">
+      <select id="listenLang" aria-label="Hands-free language" style="width:auto">
+        <option value="">Hands-free: language from settings</option><option value="auto">Auto (match me)</option>
+        <option value="en">English</option><option value="hi">हिन्दी</option><option value="hinglish">Hinglish</option>
+      </select>
+      <label class="meta"><input type="checkbox" id="listenAlways"> reply after every utterance (no “hey vox” needed)</label>
+    </div>
+    <pre class="logbox" id="logbox" hidden></pre>
+  </section>
+
   <section>
     <h2>Speak in your voice</h2>
     <textarea id="speakText" placeholder="Type anything, then press Generate."></textarea>
@@ -72,6 +104,7 @@
     <div id="log" aria-live="polite"></div>
     <div class="row">
       <input type="text" id="chatText" class="grow" placeholder="Ask anything, in English, हिन्दी or Hinglish…">
+      <button id="mic" class="ghost mic" title="Click and speak; a short pause sends it automatically" aria-label="Speak your request">🎤</button>
       <button id="send">Send</button>
     </div>
     <div class="row">
@@ -83,9 +116,50 @@
     </div>
   </section>
 
+  <section class="wide">
+    <h2>Tasks</h2>
+    <p class="meta" style="margin-top:0">Assign work to the configured coding agent. Progress and output stay visible here, including tasks created through Assistant chat.</p>
+    <div class="row">
+      <select id="taskProject" class="grow" aria-label="Project"><option value="">Loading projects…</option></select>
+    </div>
+    <textarea id="taskText" placeholder="Describe the task, for example: add a settings page and run the tests."></textarea>
+    <div class="row">
+      <button id="taskStart">Assign task</button>
+      <label class="meta"><input type="checkbox" id="taskAuto"> allow the coding agent to edit files and run commands automatically</label>
+      <span class="meta" id="taskMsg"></span>
+    </div>
+    <div id="tasks" style="margin-top:10px"><span class="meta">No tasks yet.</span></div>
+    <pre class="logbox" id="taskLog" hidden></pre>
+  </section>
+
+  <section class="wide">
+    <h2>Clone your voice</h2>
+    <p class="meta" style="margin-top:0">Read each line aloud, in a quiet room, at a steady distance from the microphone (a headset is best).
+      Click Record, read the line, click Stop. You need 20–36 seconds in all; lines that are too noisy or clipped are rejected so you can redo them.</p>
+    <div class="row" id="enStart">
+      <select id="enLang" aria-label="Language you will read in" style="width:auto">
+        <option value="en">Read English lines</option><option value="hi">पढ़ें: हिन्दी lines (used for Hindi speech)</option>
+      </select>
+      <button id="enBegin">Start recording session</button><span class="meta" id="enMsg"></span>
+    </div>
+    <div id="enBody" hidden>
+      <div id="enLines"></div>
+      <div class="meter" aria-hidden="true"><i id="enLevel"></i></div>
+      <div class="meta" id="enProgress" style="margin-top:6px"></div>
+      <div id="enSave" hidden>
+        <div class="row"><input type="text" id="enName" class="grow" placeholder="name for this voice, e.g. me" value="me">
+          <button id="enFinish">Create my voice</button></div>
+        <div class="row"><label class="meta"><input type="checkbox" id="enConsent"> This is my own voice, or I have the speaker's permission to clone it.</label></div>
+      </div>
+      <div class="row" id="enCancelRow"><button id="enCancel2" class="ghost">Cancel session</button></div>
+      <div class="err" id="enErr" role="alert"></div>
+    </div>
+  </section>
+
   <section>
     <h2>Voice profiles</h2>
     <div id="voices" class="meta">Loading…</div>
+    <div class="meta" id="vCheckMsg"></div>
     <details style="margin-top:12px"><summary>Add a voice from a WAV file</summary>
       <div class="row"><input type="text" id="vName" class="grow" placeholder="name, e.g. me">
         <select id="vLang" aria-label="Recording language" style="width:auto"><option value="en">spoken in English</option><option value="hi">spoken in Hindi</option></select></div>
@@ -113,17 +187,26 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt
 async function api(path, body) {
   const opt = body === undefined ? {} : { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) };
   const r = await fetch(path, opt);
-  if (!r.ok) { let d = r.statusText; try { d = (await r.json()).detail || d; } catch {} throw new Error(d); }
+  if (!r.ok) {
+    let d = r.statusText; try { d = (await r.json()).detail || d; } catch {}
+    if (r.status === 404 && d === 'Not Found') d = 'The backend is out of date. Close the old launcher and start VoxVortex.bat again.';
+    throw new Error(d);
+  }
   return r;
 }
 
 async function refresh() {
   try {
     const s = await (await api('/api/status')).json();
+    if (s.api_version !== 4) {
+      $('pills').innerHTML = '<span class="pill bad">backend out of date — restart VoxVortex Desktop</span>';
+      return;
+    }
     const p = (ok, label) => `<span class="pill ${ok ? 'ok' : 'bad'}">${label}</span>`;
     $('pills').innerHTML = p(s.llm.ok, 'LLM ' + esc(s.llm.ok ? s.llm.model : 'offline')) +
       p(s.tts.ok, s.tts.ok ? (s.tts.model_loaded ? 'voice ready' : 'voice service up (model loads on first use)') : 'cloned voice offline') +
-      `<span class="pill">${esc(s.active_voice || 'no voice profile')}</span>`;
+      `<span class="pill">${esc(s.active_voice || 'no voice profile')}</span>` +
+      (s.guest_mode ? '<span class="pill">guest mode: neutral voice</span>' : '');
     if (!langChosen) $('lang').value = s.language || 'auto';
     renderVoices(s.voices, s.active_voice, s.active_voice_hi);
   } catch (e) { $('pills').innerHTML = `<span class="pill bad">${esc(e.message)}</span>`; }
@@ -141,11 +224,21 @@ function renderVoices(list, active, activeHi) {
     <div class="voice"><div class="grow"><b>${esc(v.id)}</b> ${tag(v)}
       <div class="meta">${(v.language || 'en') === 'hi' ? 'Hindi' : 'English'} · ${v.quality.seconds.toFixed(0)} s · SNR ${v.quality.snr_db.toFixed(0)} dB · ${esc(v.source)}</div></div>
       ${inUse(v) ? '' : `<button class="ghost" data-act="${esc(v.id)}">Use</button>`}
+      <button class="ghost" data-chk="${esc(v.id)}" title="Clone a test sentence and score it against your recording">Check</button>
       <button class="danger" data-rev="${esc(v.id)}">Delete</button></div>`).join('') :
-    'No voice profile yet. Run <code>vox enroll</code>, or add a WAV below.';
+    'No voice profile yet. Use “Clone your voice” above, or add a WAV below.';
 }
 $('voices').addEventListener('click', async e => {
-  const act = e.target.dataset.act, rev = e.target.dataset.rev;
+  const act = e.target.dataset.act, rev = e.target.dataset.rev, chk = e.target.dataset.chk;
+  if (chk) {
+    $('vCheckMsg').textContent = `Scoring ${chk}… (the first check can take a minute)`; e.target.disabled = true;
+    try {
+      const d = await (await api(`/api/voices/${chk}/check`, {})).json();
+      $('vCheckMsg').textContent = `${d.voice}: similarity ${d.similarity.toFixed(3)} (same speaker from ${d.threshold}) — ` +
+        (d.same_speaker ? 'sounds like the same speaker.' : 'below the threshold; re-record in a quieter room.') + ' Listen too: use “Speak in your voice”.';
+    } catch (err) { $('vCheckMsg').textContent = err.message; }
+    e.target.disabled = false;
+  }
   if (act) { await api(`/api/voices/${act}/activate`, {}); refresh(); }
   if (rev && confirm(`Delete ${rev}? Its recording and derived data are removed from this PC.`)) { await api(`/api/voices/${rev}/revoke`, {}); refresh(); }
 });
@@ -170,7 +263,9 @@ async function send() {
   $('chatText').value = ''; add('msg user', text); $('send').disabled = true;
   voice.stop();
   let bot = null, said = '', pending = '';
-  const speakOn = $('speakReplies').checked;
+  // Hands-free already speaks its own replies. Duplicating them through this page
+  // lets the open microphone hear the assistant and start an echo turn.
+  const speakOn = $('speakReplies').checked && !listenRunning;
   try {
     const r = await api('/api/chat', { text, language: $('lang').value });
     const reader = r.body.getReader(), dec = new TextDecoder(); let buf = '';
@@ -187,7 +282,7 @@ async function send() {
       if (!bot) bot = add('msg bot', ''); said += ev.text; bot.textContent = said; log.scrollTop = log.scrollHeight;
       if (speakOn) {  // speak each sentence as soon as it is complete, not the whole reply at the end
         pending += ev.text; let m;
-        while ((m = pending.match(/^[\s\S]*?[.!?](\s+|$)/)) && m[1]) { voice.say(m[0]); pending = pending.slice(m[0].length); }
+        while ((m = pending.match(/^[\s\S]*?[.!?।॥](\s+|$)/)) && m[1]) { voice.say(m[0]); pending = pending.slice(m[0].length); }
       }
     }
     else if (ev.type === 'tool') { bot = null; add('chip', `${ev.name} ${JSON.stringify(ev.args)} (${ev.risk})`); }
@@ -249,13 +344,278 @@ $('vAdd').onclick = async () => {
   try { await api('/api/voices', { name: $('vName').value, transcript: $('vText').value, permission_confirmed: $('vConsent').checked, wav_base64: b64, language: $('vLang').value }); $('vMsg').textContent = 'Saved and activated.'; refresh(); }
   catch (e) { $('vMsg').textContent = e.message; }
 };
+// The panel takes due reminders itself (and shows a Windows notification); this only shows and speaks what it announced.
+// While hands-free mode runs it speaks reminders, and the panel announces none.
+let reminderSeq = null;
 async function pollReminders() {
   try {
-    const d = await (await api('/api/reminders/due')).json();
-    for (const r of d.due) { add('chip ok', 'Reminder: ' + r.text); speakText('Reminder: ' + r.text); }
+    const d = await (await api('/api/reminders/announced' + (reminderSeq === null ? '' : '?after=' + reminderSeq))).json();
+    reminderSeq = d.seq;
+    for (const r of d.reminders) {
+      const text = (r.late ? `Reminder (due ${r.due_local}): ` : 'Reminder: ') + r.text;
+      add('chip ok', text);
+      if (!listenRunning) speakText(text);
+    }
   } catch {}
 }
-refresh(); setInterval(refresh, 15000); setInterval(pollReminders, 5000);
+
+// ---- Microphone: raw PCM captured in the page and sent as a 16-bit mono WAV ----
+const recorder = {
+  stream: null, ctx: null, node: null, chunks: [], onLevel: null, onSilence: null,
+  async start(onLevel, onSilence) {
+    if (!navigator.mediaDevices) throw new Error('This browser cannot reach the microphone here. Open http://127.0.0.1 in Edge or Chrome.');
+    // Chat uses browser speech cleanup so fan noise and speaker echo do not hold a
+    // request open. Voice-cloning recordings stay raw because processing changes timbre.
+    const speechRequest = !!onSilence;
+    this.stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1,
+      echoCancellation: speechRequest, noiseSuppression: speechRequest, autoGainControl: speechRequest } });
+    this.ctx = new AudioContext(); this.chunks = []; this.onLevel = onLevel; this.onSilence = onSilence;
+    this.voiceStarted = false; this.lastVoiceAt = performance.now(); this.startedAt = performance.now(); this.autoFired = false;
+    const src = this.ctx.createMediaStreamSource(this.stream);
+    this.node = this.ctx.createScriptProcessor(4096, 1, 1);
+    this.node.onaudioprocess = e => {
+      const d = new Float32Array(e.inputBuffer.getChannelData(0)); this.chunks.push(d);
+      let s = 0; for (let i = 0; i < d.length; i++) s += d[i] * d[i];
+      const level = Math.sqrt(s / d.length), now = performance.now();
+      if (this.onLevel) this.onLevel(level);
+      if (this.onSilence && !this.autoFired) {
+        if (level >= 0.012) { this.voiceStarted = true; this.lastVoiceAt = now; }
+        if ((this.voiceStarted && now - this.lastVoiceAt >= 900) || now - this.startedAt >= 30000) {
+          this.autoFired = true;
+          setTimeout(() => this.onSilence && this.onSilence(), 0);
+        }
+      }
+    };
+    const mute = this.ctx.createGain(); mute.gain.value = 0;  // the processor only runs when connected onward
+    src.connect(this.node); this.node.connect(mute); mute.connect(this.ctx.destination);
+  },
+  async stop() {
+    const rate = this.ctx.sampleRate, chunks = this.chunks;
+    this.node.disconnect(); this.stream.getTracks().forEach(t => t.stop()); await this.ctx.close();
+    this.stream = this.ctx = this.node = null; if (this.onLevel) this.onLevel(0);
+    this.onLevel = this.onSilence = null;
+    const n = chunks.reduce((a, c) => a + c.length, 0), pcm = new Int16Array(n); let o = 0;
+    for (const c of chunks) for (let i = 0; i < c.length; i++) pcm[o++] = Math.max(-1, Math.min(1, c[i])) * 32767;
+    const buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf), w = (p, s) => [...s].forEach((ch, i) => v.setUint8(p + i, ch.charCodeAt(0)));
+    w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVEfmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+    v.setUint16(22, 1, true); v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    w(36, 'data'); v.setUint32(40, n * 2, true); new Int16Array(buf, 44).set(pcm);
+    let bin = ''; const bytes = new Uint8Array(buf);
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(bin);
+  },
+};
+
+// Speak a request: record, transcribe, send as if typed.
+let micOn = false;
+$('mic').onclick = async () => {
+  if (!micOn) {
+    if (listenRunning) {
+      add('chip', 'Hands-free is already listening. Speak to it, or stop Hands-free before using this microphone button.');
+      return;
+    }
+    try { await recorder.start(null, finishMic); } catch (e) { add('chip bad', 'Microphone: ' + e.message); return; }
+    micOn = true; $('mic').classList.add('rec'); $('mic').textContent = '⏹';
+    return;
+  }
+  finishMic();
+};
+async function finishMic() {
+  if (!micOn) return;
+  micOn = false; $('mic').classList.remove('rec'); $('mic').textContent = '…'; $('mic').disabled = true;
+  try {
+    const r = await (await api('/api/transcribe', { wav_base64: await recorder.stop() })).json();
+    if (r.text) { $('chatText').value = r.text; send(); } else add('chip', 'I did not hear anything.');
+  } catch (e) { add('chip bad', e.message); }
+  $('mic').textContent = '🎤'; $('mic').disabled = false;
+}
+
+// ---- Clone your voice: guided recording, the browser twin of `vox enroll` ----
+const en = { session: null, script: [], taken: new Set(), recording: -1, busy: false };
+function enRender(summary) {
+  const lines = $('enLines');
+  lines.innerHTML = en.script.map((t, i) => `<div class="line ${en.taken.has(i) ? 'done' : ''}">
+    <div class="grow">${en.taken.has(i) ? '✓ ' : ''}${esc(t)}</div>
+    <button class="${en.recording === i ? 'rec' : 'ghost'}" data-line="${i}" ${en.busy || (en.recording >= 0 && en.recording !== i) ? 'disabled' : ''}>${en.recording === i ? 'Stop' : (en.taken.has(i) ? 'Redo' : 'Record')}</button></div>`).join('');
+  if (summary) {
+    $('enProgress').textContent = `${summary.seconds} s recorded of ${summary.target[0]}–${summary.target[1]} s needed` + (summary.ready ? ' — enough to create your voice.' : '.');
+    $('enSave').hidden = !summary.ready;
+  }
+}
+function enReset() { en.session = null; en.script = []; en.taken = new Set(); en.recording = -1; $('enBody').hidden = true; $('enStart').hidden = false; $('enErr').textContent = ''; }
+$('enBegin').onclick = async () => {
+  $('enMsg').textContent = '';
+  try {
+    const d = await (await api('/api/enroll/start', { language: $('enLang').value })).json();
+    en.session = d.session; en.script = d.script; en.taken = new Set(); en.recording = -1;
+    $('enName').value = d.language === 'hi' ? 'me-hi' : 'me';
+    $('enStart').hidden = true; $('enBody').hidden = false; $('enSave').hidden = true; $('enErr').textContent = '';
+    enRender(d);
+  } catch (e) { $('enMsg').textContent = e.message; }
+};
+$('enLines').addEventListener('click', async e => {
+  const idx = e.target.dataset.line; if (idx === undefined) return;
+  const i = +idx; $('enErr').textContent = '';
+  if (en.recording < 0) {
+    try { await recorder.start(l => { $('enLevel').style.width = Math.min(100, l * 300) + '%'; }); } catch (err) { $('enErr').textContent = 'Microphone: ' + err.message; return; }
+    en.recording = i; enRender(); return;
+  }
+  en.recording = -1; en.busy = true; enRender();
+  try {
+    const wav = await recorder.stop();
+    const d = await (await api('/api/enroll/take', { session: en.session, index: i, wav_base64: wav })).json();
+    en.taken = new Set(d.taken);
+    const notes = [...d.warnings, ...d.errors];
+    $('enErr').textContent = d.accepted ? (notes.length ? 'Kept. Note: ' + notes.join(' ') : '') : 'Not kept: ' + notes.join(' ') + ' Try that line again.';
+    en.busy = false; enRender(d);
+  } catch (err) { en.busy = false; $('enErr').textContent = err.message; enRender(); }
+});
+$('enCancel2').onclick = async () => { if (recorder.stream) { try { await recorder.stop(); } catch (_) {} } await api('/api/enroll/cancel', {}).catch(() => {}); enReset(); };
+$('enFinish').onclick = async () => {
+  $('enErr').textContent = '';
+  try {
+    const p = await (await api('/api/enroll/finish', { session: en.session, name: $('enName').value, permission_confirmed: $('enConsent').checked })).json();
+    enReset(); $('enMsg').textContent = `Saved and activated ${p.id}. Try it in “Speak in your voice”, and press Check on the voice below.`; $('enStart').hidden = false;
+    $('voiceMode').value = 'cloned'; refresh();
+  } catch (e) { $('enErr').textContent = e.message; }
+};
+
+// ---- Services: what is running, and start / stop ----
+const svcLabel = { running:['ok','running'], external:['ok','running (started elsewhere)'], starting:['','starting…'], failed:['bad','stopped unexpectedly'], stopped:['','stopped'] };
+let logFor = null, listenRunning = false, listenRunId = null, listenEventSeq = 0, hfBot = null, hfSaid = '';
+async function refreshServices() {
+  let list;
+  try { list = (await (await api('/api/services')).json()).services; } catch (e) { $('services').textContent = e.message; return; }
+  const listener = list.find(s => s.name === 'listen');
+  listenRunning = !!listener && ['running', 'starting', 'external'].includes(listener.state);
+  $('services').innerHTML = list.map(s => {
+    const [cls, txt] = svcLabel[s.state] || ['', s.state], on = s.state === 'running' || s.state === 'starting';
+    return `<div class="svc"><div class="grow"><b>${esc(s.title)}</b> <span class="pill ${cls}">${txt}</span></div>
+      ${s.controllable ? (on ? `<button class="ghost" data-svc="${s.name}" data-do="restart">Restart</button><button class="danger" data-svc="${s.name}" data-do="stop">Stop</button>`
+                             : `<button data-svc="${s.name}" data-do="start">Start</button>`) : ''}
+      <button class="ghost" data-log="${s.name}">${logFor === s.name ? 'Hide log' : 'Log'}</button></div>`;
+  }).join('');
+  if (logFor) {
+    const l = (await (await api(`/api/services/${logFor}/logs?lines=150`)).json()).lines;
+    const box = $('logbox'), atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
+    box.hidden = false; box.textContent = l.join('\n') || '(no output yet)'; if (atEnd) box.scrollTop = box.scrollHeight;
+  } else $('logbox').hidden = true;
+}
+
+// The listener runs in an isolated process for audio reliability, but its accepted
+// requests, tool activity and replies belong in the same visible conversation.
+async function refreshListenEvents() {
+  try {
+    const q = `/api/services/listen/events?after=${listenEventSeq}` +
+      (listenRunId === null ? '' : `&run_id=${listenRunId}`);
+    const d = await (await api(q)).json();
+    if (listenRunId !== d.run_id) {
+      listenRunId = d.run_id; listenEventSeq = 0; hfBot = null; hfSaid = '';
+    }
+    for (const ev of d.events) {
+      listenEventSeq = Math.max(listenEventSeq, ev.seq);
+      if (ev.kind === 'request') {
+        add('msg user', '🎙 ' + ev.text); hfBot = null; hfSaid = '';
+      } else if (ev.kind === 'say') {
+        if (!hfBot) hfBot = add('msg bot', '');
+        hfSaid += ev.text; hfBot.textContent = hfSaid; log.scrollTop = log.scrollHeight;
+      } else if (ev.kind === 'tool') {
+        hfBot = null; hfSaid = '';
+        add('chip', `Hands-free · ${ev.name} ${JSON.stringify(ev.args)} (${ev.risk})`);
+      } else if (ev.kind === 'tool_result') {
+        add('chip ' + (ev.ok ? 'ok' : 'bad'), `Hands-free · ${ev.name}: ${ev.ok ? 'done' : 'not done'} [${ev.decision}]`);
+      } else if (ev.kind === 'confirm_request') {
+        add('chip', `Hands-free is waiting for a spoken yes or no: ${ev.intent}`);
+      } else if (ev.kind === 'error') {
+        add('chip bad', `Hands-free ${ev.where || ''}: ${ev.message || 'error'}`);
+      }
+    }
+  } catch (_) {}
+}
+
+async function applyListenOptions() {
+  try {
+    localStorage.setItem('voxListenAlways', $('listenAlways').checked ? '1' : '0');
+    localStorage.setItem('voxListenLang', $('listenLang').value);
+  } catch (_) {}
+  if (!listenRunning) return;
+  try {
+    await api('/api/services/listen/restart', { always: $('listenAlways').checked, language: $('listenLang').value || null });
+    add('chip ok', 'Hands-free restarted with the new listening setting.');
+  } catch (e) { add('chip bad', e.message); }
+  refreshServices();
+}
+try {
+  $('listenAlways').checked = localStorage.getItem('voxListenAlways') === '1';
+  $('listenLang').value = localStorage.getItem('voxListenLang') || $('listenLang').value;
+} catch (_) {}
+$('listenAlways').addEventListener('change', applyListenOptions);
+$('listenLang').addEventListener('change', applyListenOptions);
+$('services').addEventListener('click', async e => {
+  const t = e.target;
+  if (t.dataset.log) { logFor = logFor === t.dataset.log ? null : t.dataset.log; return refreshServices(); }
+  if (!t.dataset.svc) return;
+  t.disabled = true;
+  try { await api(`/api/services/${t.dataset.svc}/${t.dataset.do}`, { always: $('listenAlways').checked, language: $('listenLang').value || null }); }
+  catch (err) { alert(err.message); }
+  refreshServices(); refresh();
+});
+
+// ---- Coding tasks: assign, watch output, and stop -------------------------------------------------------------
+const taskStateLabel = {
+  running:['','working'], completed:['ok','completed'], failed:['bad','failed'], cancelled:['','stopped']
+};
+let taskLogFor = null;
+async function loadProjects() {
+  try {
+    const list = (await (await api('/api/projects')).json()).projects;
+    $('taskProject').innerHTML = list.length ? list.map(p => `<option value="${esc(p.name)}">${esc(p.name)}</option>`).join('') :
+      '<option value="">No projects found</option>';
+    const here = list.find(p => p.name.toLowerCase() === 'voxvortex_pc_assistant');
+    if (here) $('taskProject').value = here.name;
+  } catch (e) { $('taskProject').innerHTML = `<option value="">${esc(e.message)}</option>`; }
+}
+async function refreshTasks() {
+  let list;
+  try { list = (await (await api('/api/tasks')).json()).tasks; }
+  catch (e) { $('tasks').innerHTML = `<span class="err">${esc(e.message)}</span>`; return; }
+  $('tasks').innerHTML = list.length ? list.map(t => {
+    const [cls, label] = taskStateLabel[t.status] || ['', t.status];
+    return `<div class="task ${esc(t.status)}"><div class="task-head"><div class="grow"><b>${esc(t.project)}</b>
+      <span class="pill ${cls}">${label}</span><div class="task-prompt">${esc(t.prompt)}</div>
+      <div class="meta">${Math.round(t.elapsed_s)} s${t.last_line ? ' · ' + esc(t.last_line) : ''}</div></div>
+      ${t.status === 'running' ? `<button class="danger" data-task-stop="${t.id}">Stop</button>` : ''}
+      <button class="ghost" data-task-log="${t.id}">${taskLogFor === t.id ? 'Hide output' : 'Output'}</button></div>
+      <div class="task-progress"></div></div>`;
+  }).join('') : '<span class="meta">No tasks yet.</span>';
+  if (taskLogFor) {
+    try {
+      const t = await (await api(`/api/tasks/${taskLogFor}`)).json(), box = $('taskLog');
+      const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
+      box.hidden = false; box.textContent = t.output.join('\n') || '(waiting for output)';
+      if (atEnd) box.scrollTop = box.scrollHeight;
+    } catch (_) { taskLogFor = null; $('taskLog').hidden = true; }
+  } else $('taskLog').hidden = true;
+}
+$('taskStart').onclick = async () => {
+  const task = $('taskText').value.trim(), project = $('taskProject').value;
+  if (!task || !project) { $('taskMsg').textContent = 'Choose a project and describe the task.'; return; }
+  if ($('taskAuto').checked && !confirm('Allow this coding agent task to edit files and run commands without asking each time?')) return;
+  $('taskStart').disabled = true; $('taskMsg').textContent = 'Starting…';
+  try {
+    const t = await (await api('/api/tasks', { project, task, allow_changes: $('taskAuto').checked })).json();
+    $('taskText').value = ''; $('taskMsg').textContent = `Task ${t.id} started.`; taskLogFor = t.id;
+  } catch (e) { $('taskMsg').textContent = e.message; }
+  $('taskStart').disabled = false; refreshTasks(); refresh();
+};
+$('tasks').addEventListener('click', async e => {
+  const id = e.target.dataset.taskLog || e.target.dataset.taskStop; if (!id) return;
+  if (e.target.dataset.taskLog) { taskLogFor = taskLogFor === id ? null : id; return refreshTasks(); }
+  if (confirm('Stop this task?')) { e.target.disabled = true; await api(`/api/tasks/${id}/stop`, {}).catch(err => alert(err.message)); refreshTasks(); }
+});
+
+refresh(); refreshServices(); refreshListenEvents(); loadProjects(); refreshTasks();
+setInterval(refresh, 15000); setInterval(refreshServices, 3000); setInterval(refreshListenEvents, 700); setInterval(refreshTasks, 2000); setInterval(pollReminders, 5000);
 </script>
 </body>
 </html>

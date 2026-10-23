@@ -12,7 +12,10 @@ from ..permissions import Risk, Tool, fail, ok
 
 SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".pytest_tmp", "site-packages",
              "$RECYCLE.BIN", "System Volume Information", ".cache", "dist", "build"}
-SECRET_NAMES = re.compile(r"(^\.env|secret|credential|password|\.pem$|\.key$|id_rsa|\.kdbx$|token)", re.I)
+SECRET_NAMES = re.compile(r"(^\.env|secret|credential|password|passwd|token|\.pem$|\.key$|\.pfx$|\.p12$|\.jks$|\.keystore$|"
+                          r"\.kdbx$|^id_(rsa|dsa|ecdsa|ed25519)|^[._]?(npmrc|pypirc|netrc|pgpass|htpasswd)$)", re.I)
+# Folders that hold keys or tokens (.git/config can carry a token in a remote URL): nothing inside them is read.
+SECRET_DIRS = {".git", ".ssh", ".aws", ".azure", ".gnupg", ".kube", ".docker"}
 MAX_READ = 6000
 
 
@@ -28,6 +31,10 @@ def inside_roots(path: Path, roots: list[Path]) -> bool:
     return any(resolved == r or r in resolved.parents for r in roots)
 
 
+def looks_secret(path: Path) -> bool:
+    return bool(SECRET_NAMES.search(path.name)) or any(part.lower() in SECRET_DIRS for part in path.parts)
+
+
 def search(roots: list[Path], query: str, *, limit: int = 15, newest_first: bool = True, budget_s: float = 8.0) -> list[dict]:
     """Every word of `query` must appear in the file or folder name (case-insensitive)."""
     words = [w for w in re.split(r"\W+", query.lower()) if w]
@@ -37,7 +44,7 @@ def search(roots: list[Path], query: str, *, limit: int = 15, newest_first: bool
     deadline = time.monotonic() + budget_s
     for root in roots:
         for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and d.lower() not in SECRET_DIRS]
             for name in filenames + dirnames:
                 low = name.lower()
                 if all(w in low for w in words) and not SECRET_NAMES.search(name):
@@ -66,7 +73,7 @@ def make_tools(settings: Settings) -> list[Tool]:
         path = Path(str(args.get("path", "")))
         if not inside_roots(path, _roots(settings)):
             return fail("That path is outside the folders I am allowed to search.")
-        if SECRET_NAMES.search(path.name):
+        if looks_secret(path) or looks_secret(path.resolve()):
             return fail("That file looks like it holds secrets; I will not read it.")
         if not path.is_file():
             return fail("No such file.")

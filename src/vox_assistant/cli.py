@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -24,12 +25,15 @@ def _agent(settings: Settings, confirm):
     from .agent import Agent
     from .audit import AuditLog
     from .permissions import PermissionGate
+    from .tasks import PanelTasks
     from .tools import build_registry
 
     audit = AuditLog(settings.audit_db)
-    registry, store = build_registry(settings)
-    return Agent(_llm(settings), registry, PermissionGate(confirm, audit), audit, name=settings.assistant_name,
-                 gender=settings.hindi_self_gender), store
+    # Started by the control panel: coding tasks go to its Tasks panel. On its own: a visible terminal per task.
+    panel = os.getenv("VOXA_PANEL_URL")
+    registry, store = build_registry(settings, task_manager=PanelTasks(panel) if panel else None, audit=audit)
+    return Agent(_llm(settings), registry, PermissionGate(confirm, audit, set(settings.auto_approve)), audit,
+                 name=settings.assistant_name, gender=settings.hindi_self_gender), store
 
 
 def _neutral_tts(settings: Settings):
@@ -192,7 +196,7 @@ def cmd_llm_server(args, settings) -> int:
 def cmd_serve(args, settings) -> int:
     from .webapp import main
 
-    main()
+    main(settings)
     return 0
 
 
@@ -209,6 +213,10 @@ def cmd_listen(args, settings) -> int:
     colors = {"heard": "you", "say": None}
 
     def show(ev: dict) -> None:
+        # The launcher consumes this machine-readable copy and mirrors accepted hands-free
+        # turns into the Assistant panel. Keep the normal lines below useful to humans.
+        if os.getenv("VOXA_EVENT_STREAM") == "1":
+            print("@@VOXA_EVENT@@" + json.dumps(ev, ensure_ascii=False, default=str), flush=True)
         k = ev["kind"]
         if k == "heard":
             print(f"\nyou: {ev['text']}")
@@ -226,6 +234,8 @@ def cmd_listen(args, settings) -> int:
             print(f"\n  (listening - {ev['via']})")
         elif k == "language":
             print(f"\n  (language: {ev['mode']})")
+        elif k == "ignored":
+            print("\n  (heard, but ignored because the wake phrase was missing)")
 
     async def go() -> int:
         import threading
@@ -250,7 +260,8 @@ def cmd_listen(args, settings) -> int:
             cloned = None
         loop = VoiceLoop(agent=agent, asr=asr, tts=cloned, neutral_tts=_neutral_tts(settings), speaker=Speaker(settings.output_device),
                          vad=SileroVAD(settings.silero_model), settings=settings, reminders=store, spotter=spotter,
-                         mode="always" if args.always else "wake", on_event=show)
+                         mode="always" if args.always else "wake", end_silence_ms=settings.end_silence_ms,
+                         on_event=show)
         hotkey = None
         if settings.hotkey:
             running = asyncio.get_running_loop()

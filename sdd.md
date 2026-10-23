@@ -73,11 +73,11 @@
 | FR-18 | Never report an action as done unless a tool performed it | P1 | Verified (unit, 27B live; 4B eval: 0 false claims in 48) |
 | FR-19 | Audit every tool request, decision and result | P1 | Verified |
 | FR-20 | Mute, unmute, voice-mode switching by voice, without the LLM | P1 | Verified |
-| FR-21 | Local web app: voice studio, chat with approval buttons, voice management, audit view | P1 | Verified (API on a real socket; rendering checked in headless Edge at 1400 px and 375 px) |
+| FR-21 | Local control panel: service controls/logs, voice studio/enrollment, chat with approval buttons and microphone input, tracked task view, voice management, audit view | P1 | Verified (API tests, JavaScript parse, live browser rendering) |
 | FR-22 | CLI for enrollment, voices, speaking, asks, serving, listening, LLM server, diagnostics | P1 | Verified (`doctor`, `ask`, `voices check` path, `llm-server`); `enroll`/`listen` **need a person** at a microphone |
 | FR-23 | LLM workload control by voice: list loadable models, load a model on a GPU, unload a GPU | P2 | Verified against a mock Dual_gpu (unit) and the live catalog (read); live load/unload **not run** (would replace the owner's lane configuration) |
 | FR-24a | Project switching ("switch to the Cutline project" → VS Code) | P2 | Verified live (window title confirmed) |
-| FR-24b | Coding-agent delegation (OpenCode in a new terminal in the project) | P2 | Verified live (agent process started in the right folder, then stopped) |
+| FR-24b | Coding-agent delegation with project selection, live status/output, elapsed time and cancellation in the control panel | P2 | Verified (unit + API); earlier visible-terminal path verified live |
 | FR-24c | Screen understanding (local vision model) | P2 | Verified live |
 | FR-24d | Application/window control: list, focus, minimize, maximize, restore, close | P2 | Verified live on a Notepad window it opened |
 | FR-24e | Personal knowledge retrieval (full-text search of notes) | P3 | Verified live |
@@ -95,16 +95,16 @@
 
 | ID | Requirement | Target | Status |
 | --- | --- | --- | --- |
-| NFR-01 | No cloud AI requests during use | zero | Met by design (loopback clients; no cloud SDK). Not confirmed with a network monitor. `web_search` opens the user's own browser after approval |
+| NFR-01 | No cloud AI requests during use | zero | Met for AI inference (loopback clients; no cloud AI SDK). An approved `web_search` sends the query to DuckDuckGo and may read a selected public result; no local/private URL is fetched |
 | NFR-02 | First audible response after end of speech | 1–2 s | **Met**: plain English 0.93–1.04 s; Hindi with a tool 1.62–1.67 s; English with two tools 1.82–2.14 s (edge); acknowledgement 0.76–1.20 s. All with the 9070 XT lane idle; when it generates at the same time, +1–2 s (R2) |
 | NFR-03 | Wake reaction | < 300 ms | **Met in a different form**: the spotter (~140 ms per check, every 250 ms) acknowledges the wake phrase *while the user is still speaking* (3.5 s before the end of a 4.8 s request); the hotkey reacts in < 1 ms |
 | NFR-04 | Interruption stops audio promptly | ~64 ms after detection; detection 320 ms | Implemented; verified in scripted tests |
 | NFR-05 | Voice similarity | blind-listening test | **Measured on a synthetic speaker**: 0.978 to its own reference vs 0.474 to another speaker (threshold 0.86). **Needs a person** for the owner's voice and the listening test |
-| NFR-06 | Desktop operations confirmed from real state | always | Met where checkable; `open_url`/`web_search`/`open_path` say they cannot confirm |
+| NFR-06 | Desktop operations confirmed from real state | always | Met where checkable; `open_url`/`open_path` say they cannot confirm. Web facts must be present in retrieved search/page data |
 | NFR-07 | Local services not drivable by a web page | loopback + header checks | Verified |
 | NFR-08 | Voice data under owner control | plain files, deletable | Verified |
 | NFR-09 | Degrade gracefully | fallback, apology | Verified |
-| NFR-10 | Maintainable, hardware-free tests | | 157 tests, no GPU/mic needed |
+| NFR-10 | Maintainable, hardware-free tests | | 174 tests, no GPU/mic needed |
 
 ## 4. Design decisions
 
@@ -173,7 +173,7 @@ Invariants:
 
 ## 8. Verification
 
-### 8.1 Automated tests (157, `pytest`, no GPU/microphone required)
+### 8.1 Automated tests (174, `pytest`, no GPU/microphone required)
 
 | File | Tests | Covers (language update) |
 | --- | ---: | --- |
@@ -193,6 +193,7 @@ Also added: 3 voice-loop tests (Hindi wake phrase and auto reply; switching by v
 | `test_voice.py` | 29 | first-build loop behaviour plus wake spotting, false-wake rejection, hotkey, chime instead of "Yes?", guest mode (voice and notice), keep-warm, acknowledgements, speculative ASR, eager first clause, opening-silence trim, seamless resampling, reminder claimed-then-fired |
 | `test_webapp.py` | 10 | page, guard, speak proxy, streamed page speech, voices, chat, confirmation over a real server |
 | `test_gaps.py` | 9 | enrollment helpers, TTS guard, executables refused, HTTP reminders, wake spellings |
+| `test_launcher.py` | 14 | service lifecycle/log capture, one-click control-panel APIs, browser enrollment/transcription, similarity proxy, tracked coding-task progress/output/cancellation |
 
 ### 8.2 Real-component scripts
 
@@ -283,6 +284,25 @@ Findings 1–13 are from the first build (false "Notepad is open" claim, second 
 | 55 | No Windows Hindi voice: the neutral voice could not speak Hindi | Medium | voice inventory | neutral Hindi through the voice service (D38) |
 | 56 | First GPU recognition after start took 5 s | Low | smoke | warm-up on 1/3/6/10 s inputs at start |
 | 57 | Clone-check, smoke and eval measured CER on the combined two-reading text, and the wake phrase on its start only | Low (test bugs) | review | per-reading CER and wake check |
+| 58 | A turn cancelled while an approval was pending (closed chat stream, barge-in) left a tool call with no result in the history, which makes the next request invalid | **High** | gap review | every open call of the reply gets an "interrupted, not done" result and an audit row |
+| 59 | Answering the spoken yes/no question before it ended counted as barge-in and cancelled the turn; the "yes" then ran as a new request | **High** (UX, permissions) | gap review | the answer is listened for from the question's first word; speech stops the question, not the turn |
+| 60 | Any YES word anywhere approved: "what do you mean" (has "do") was consent | **High** (permissions) | gap review | a yes must start a short answer; questions and hesitations ("wait", "kya") are unclear and asked again |
+| 61 | The coding-task approval did not say `allow_changes` (OpenCode `--auto`) was on, and `bool("false")` turned it on | **High** (permissions) | gap review | the question names it; only a real true counts; such a call is never pre-approved |
+| 62 | `open_path` refused a list of program types, so others ran: `.sh` opens in Git Bash here, `.chm`/`.pif`/`.appref-ms`/`.sct` have handlers | **High** (security) | gap review | only folders, documents and media go to their default app; anything else opens in VS Code (`Code.exe` directly, no shell) |
+| 63 | `open_url`'s approval named only the site, hiding data in the path or query | Medium (security) | gap review | the whole address is shown |
+| 64 | The own-lane check never matched (the assistant's LLM is not a lane), and nothing covered the voice service's GPU | Medium | gap review | a load on a GPU the assistant uses is said in the approval and followed by a check that its LLM / voice still answer |
+| 65 | Coding tasks asked for by voice skipped the Tasks panel; parallel tasks in one project; no time limit; history lost on restart; `allow_changes` silently ignored for other agents | Medium | gap review | hands-free sends them to the panel (`VOXA_PANEL_URL`); one per project; `coding_task_timeout_min`; `tasks.json`; a clear error |
+| 66 | Reminders: page and hands-free both consumed them, a GET marked them fired, none fired with the page closed, late ones gave no time, the page spoke them while hands-free listened | Medium | gap review | one atomic take across processes; the panel announces (page + Windows notification) unless hands-free speaks them; late ones say when they were due |
+| 67 | The web page waited for the end of a Hindi reply before speaking (sentences split on `. ! ?` only) | Low | gap review | `।` and `॥` end sentences too |
+| 68 | Guest mode was ignored by the web panel | Medium (disclosure) | gap review | the panel speaks only in the neutral voice while guest mode is on, by setting or by voice in hands-free mode |
+| 69 | `vox serve` ignored `--data-dir` and left services it started running; `auto_approve` was documented but not settable | Low | gap review | fixed; `auto_approve` is a setting |
+| 70 | The test-only Host `testserver` was accepted in production; secret filter missed `id_ed25519`, `.npmrc`, `.netrc`, `.pfx`, `.git/` | Low (security) | gap review | removed; wider filter including secret folders |
+| 71 | Workflow steps were not audited one by one; a locked audit DB could crash a turn; two chat requests could race past the busy check; env settings could not set tables or device indexes | Low | gap review | fixed (WAL + timeout, writes never raise; lock taken in the request) |
+| 72 | Hinglish replies to Hinglish typed in English letters came back romanized (7/8), and the voice read the Hindi words with English pronunciation | **High** (Hindi) | reply probe | prompt asks for Devanagari Hindi words (romanized 7/8 → 4/8); the voice service converts the rest before speaking (Hindi words heard back 55% → 80%) |
+| 73 | "Neutral" Hindi self-reference ignored (मैं … सकता हूँ) | Medium | reply probe | the prompt names the gendered forms and asks for हम / impersonal forms; still imperfect with the 4B: set `hindi_self_gender` for fully natural Hindi |
+| 74 | Times were read as "बारह बजकर शून्य मिनट बजे"; 24-hour times as "उन्नीस बजकर तीस मिनट" | Medium | reply probe | said the Hindi way: शाम साढ़े सात बजे, सवा आठ, पौने नौ; the part of the day only when the 24-hour time makes it certain |
+| 75 | The 4B once began a reply by echoing the message stamp "[10:24, reply in Hinglish]" | Low | reply probe | stripped before speaking and from the history |
+| 76 | Hands-free utterances had no length limit: steady noise held one open past 60 s, the voice service refused it (400) and recognition fell back to the English-only CPU model; the warning hid the reason. Ctrl+C on `python main.py` from a global Python printed a traceback | Medium | owner's run | utterances end at 30 s; at most 60 s is sent and a refusal is logged with its reason; the launcher waits for the panel to stop its services |
 
 ## 11. Risks and open issues
 
@@ -291,7 +311,7 @@ Findings 1–13 are from the first build (false "Notepad is open" claim, second 
 | R1 | Driver/wheel drift: a future Adrenalin or ROCm wheel may change which HIP runtime works | Cloned voice stops | `tts_hip_runtime` switch; smoke §2 probes exactly the service's loading path |
 | R2 | 9070 XT shared between the voice model (~5–7 GB) and the Dual_gpu 27B Q3 lane (~14 GB) | **Measured**: speech +1–2 s while the lane works; the lane can be left partly in system RAM (~6 tokens/s) until reloaded | Owner's choice (README "Sharing the GPUs"): unload that lane while talking (the assistant can, destructive, asks), or shrink the R9700 lane's context so the voice stack fits beside it |
 | R3 | English answer with two tools 1.82–2.14 s vs 2 s | Small | Remaining levers: endpointing, fewer LLM rounds for tool questions |
-| R12 | Hindi / Hinglish accuracy measured only with synthetic, English-accented speakers (15/18, 14/18) | Unknown for the owner | Run `scripts/language_eval.py` style checks with real recordings; enroll a Hindi reference |
+| R12 | Hindi / Hinglish accuracy measured only with synthetic, English-accented speakers (15/18, 14/18; on 12 held-out requests 9/18, 13/18). Most misses are recognition (Hindi CER 23–27%), not understanding: prompt hints for misheard words helped the sentences they came from but not held-out ones, so they were not kept | Unknown for the owner | Run `scripts/language_eval.py` style checks with real recordings; enroll a Hindi reference. Whisper large-v3 (full) was compared on the CPU (2026-10-23): a little better on Hindi intent (+2–4/18) but loops on some clips (held-out CER 71%) and picks the wrong reply language far more often for Hinglish (6/18, 11/18) and English (16/18), ~8x the decoder work: not adopted. A Whisper fine-tuned on the owner's own speech is the next lever, once there are recordings |
 | R13 | Speech recognition adds 1.7 GB to the 9070 XT | More contention with the 27B Q3 lane (R2) | `asr_device` can move it; `asr_backend = "cpu"` for English-only use |
 | R14 | Hindi replies sometimes use gendered self-reference; Hinglish often romanized | Style | `hindi_self_gender`; both scripts are spoken acceptably |
 | R4 | No echo cancellation | Self-hearing on speakers | Headset (A1) |
@@ -334,7 +354,7 @@ Milestones: M1 "prove your voice clone": the clone works, streams, and is scored
 
 **Run.** `scripts\start_all.ps1 [serve|listen]`, or separately `scripts\start_llm.ps1`, `scripts\start_tts.ps1`, `scripts\start.ps1 serve|listen`. `vox doctor` for reachability and environment problems.
 
-**Release check.** `pytest` (157 pass) → `smoke_test.py` (0 FAIL) → `clone_check.py` (0 FAIL) → `agent_eval.py` after any prompt, tool or model change → `language_eval.py` after any recognition or language change → `desktop_check.py` after tool changes (visible side effects, all undone).
+**Release check.** `pytest` (174 pass) → `smoke_test.py` (0 FAIL) → `clone_check.py` (0 FAIL) → `agent_eval.py` after any prompt, tool or model change → `language_eval.py` after any recognition or language change → `desktop_check.py` after tool changes (visible side effects, all undone).
 
 **Recovery.** Bad voice version: `vox voices use <older id>`. Voice leak concern: `vox voices revoke <id>`. Runaway assistant: say "mute", or close the process. Cloned voice broken after a driver update: `VOXA_TTS_HIP_RUNTIME=bundled` to compare, then smoke §2.
 

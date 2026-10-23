@@ -315,3 +315,35 @@ async def test_a_running_tool_finishes_and_is_recorded_when_the_turn_is_cancelle
     assert finished == [1]                                   # not abandoned half way
     assert agent.history[-1]["role"] == "tool"               # and its result is in the history
     assert audit.recent()[0]["tool"] == "slow" and audit.recent()[0]["ok"] == 1
+
+
+async def test_interrupted_while_waiting_for_approval_answers_every_open_call(audit):
+    asking = asyncio.Event()
+
+    async def confirm(intent, tool, args):
+        asking.set()
+        await asyncio.sleep(3600)  # the user has not answered yet
+
+    llm = ScriptedLLM([call("poke", id="c1"), call("poke", id="c2")], [TextDelta("Okay.")])
+    agent, calls = make(audit, llm, confirm=confirm)
+
+    async def go():
+        async for _ in agent.run("poke twice"):
+            pass
+
+    task = asyncio.create_task(go())
+    await asyncio.wait_for(asking.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert calls == []  # nothing ran
+    results = [m for m in agent.history if m["role"] == "tool"]
+    assert [m["tool_call_id"] for m in results] == ["c1", "c2"]  # each call has a result, so the next request is valid
+    assert all(json.loads(m["content"])["ok"] is False for m in results)
+    assert audit.recent()[0]["decision"] == "interrupted"
+
+    async for _ in agent.run("never mind"):  # the conversation carries on
+        pass
+    sent = llm.seen[-1]
+    open_ids = {c["id"] for m in sent if m.get("tool_calls") for c in m["tool_calls"]}
+    assert open_ids == {m["tool_call_id"] for m in sent if m["role"] == "tool"}

@@ -59,20 +59,26 @@ def tag(lang: str) -> str:
 
 def rules(gender: str = "neutral") -> str:
     """The language part of the system prompt (stable, so the prompt prefix stays cached)."""
-    self_ref = {"male": "When you speak about yourself in Hindi, use masculine verb forms (मैं देख रहा हूँ).",
-                "female": "When you speak about yourself in Hindi, use feminine verb forms (मैं देख रही हूँ).",
-                }.get(gender, "When you speak about yourself in Hindi, prefer forms that do not mark gender, such as "
-                              "देखते हैं or करूँ?, over रहा हूँ / रही हूँ.")
+    self_ref = {"male": "When you speak about yourself in Hindi, use masculine verb forms (मैं देख रहा हूँ, मैं कर सकता हूँ).",
+                "female": "When you speak about yourself in Hindi, use feminine verb forms (मैं देख रही हूँ, मैं कर सकती हूँ).",
+                }.get(gender, "When you speak about yourself in Hindi or Hinglish, never use मैं with a gendered verb "
+                              "(रहा हूँ, रही हूँ, सकता हूँ, सकती हूँ, करता हूँ, करती हूँ). Use the plural हम forms, which do not "
+                              "mark gender, or impersonal ones: हम यह कर सकते हैं, अभी देखते हैं, यह नहीं हो सकता, करूँ?")
     return (
         "Languages: the user may speak English, Hindi or Hinglish; understand all three. A spoken message may carry two "
         "transcriptions of the same speech, a Hindi one and '(the same speech heard as English: ...)'; understand the user "
         "from whichever makes sense and never mention the transcriptions. Speech transcripts often contain phonetic "
-        "misspellings (for example 'बैटरी चेकरो' for 'battery check करो', 'Chrome Kolo' for 'Chrome खोलो'); work out the "
-        "words the user meant before deciding. Reply in the language named in the brackets at "
+        "misspellings; work out the words the user meant before deciding. English technical words are often written "
+        "phonetically in Devanagari ('बैटरी चेकरो' = battery check करो), and Hindi words in the English transcription are "
+        "often spelled as English words that sound alike ('Chrome Kolo' = Chrome खोलो). Reply in the language named in "
+        "the brackets at "
         "the start of the user's message: English; Hindi = Hindi in Devanagari script, keeping technical terms, app, "
         "product and model names, file names and units in English letters (GPU, RAM, Notepad, Qwen 3.8); Hinglish = "
-        "natural Indian Hindi-English mixing, Hindi words in Devanagari and English words in English letters. Write "
-        f"numbers as digits. Tool names and tool arguments always stay in English. {self_ref}"
+        "natural Indian Hindi-English mixing, every Hindi word in Devanagari and every English word in English letters, "
+        "even when the user typed Hindi in English letters: for 'mere GPU ka temperature kya hai' answer like "
+        "'आपके दोनों GPU का temperature normal है।', never 'Aapke dono GPU ka temperature normal hai.' (Hindi in English "
+        "letters is read aloud with English pronunciation). Write numbers as digits. Tool names and tool arguments always "
+        f"stay in English. {self_ref}"
     )
 
 
@@ -91,6 +97,7 @@ PHRASES: dict[str, dict[str, str]] = {
         "guest_off": "Guest mode is off.",
         "notice": "Just so everyone knows, I'm an AI assistant, and this is a computer voice.",
         "reminder": "Reminder: {text}",
+        "reminder_late": "A reminder that was due at {time}: {text}",
         "error": "Sorry, something went wrong on my side.",
         "switched": "Okay, I'll speak English.",
         "switched_auto": "Okay, I'll answer in whichever language you use.",
@@ -110,6 +117,7 @@ PHRASES: dict[str, dict[str, str]] = {
         "guest_off": "Guest mode बंद।",
         "notice": "सबकी जानकारी के लिए: यह एक AI assistant है, और यह कंप्यूटर की आवाज़ है।",
         "reminder": "याद दिलाना था: {text}",
+        "reminder_late": "{time} का रिमाइंडर: {text}",
         "error": "माफ़ कीजिए, कुछ गड़बड़ हो गई।",
         "switched": "ठीक है, अब हिंदी में बात करते हैं।",
         "switched_auto": "ठीक है, आप जिस भाषा में बोलेंगे, उसी में जवाब मिलेगा।",
@@ -121,7 +129,7 @@ PHRASES: dict[str, dict[str, str]] = {
         "confirm": "{intent} — करूँ? Yes के लिए हाँ बोलिए, cancel के लिए ना।",
         "unclear": "Sorry, बस हाँ या ना बोलिए।",
         "muted": "Mute हो गया। वापस लाने के लिए wake phrase के बाद unmute बोलिए।",
-        "unmuted": "फिर से sun रहे हैं।",
+        "unmuted": "फिर से सुन रहे हैं।",
         "neutral_on": "अब neutral voice में बात होगी।",
         "cloned_on": "अब आपकी cloned voice में बात होगी।",
         "cloned_blocked": "Guest mode on है, इसलिए neutral voice ही रहेगी।",
@@ -129,6 +137,7 @@ PHRASES: dict[str, dict[str, str]] = {
         "guest_off": "Guest mode off।",
         "notice": "Just so everyone knows, यह एक AI assistant है और यह computer की आवाज़ है।",
         "reminder": "Reminder: {text}",
+        "reminder_late": "{time} का reminder: {text}",
         "error": "Sorry, कुछ गड़बड़ हो गई।",
         "switched": "Okay, अब Hinglish में बात करते हैं।",
         "switched_auto": "Okay, आप जिस language में बोलेंगे, उसी में जवाब मिलेगा।",
